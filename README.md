@@ -60,6 +60,7 @@ npm ci
 npm run check
 npm test
 npm run test:ui
+npm run test:runtime
 npm run build
 ```
 

@@ -19,6 +19,7 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run test:ui
+      - run: npm run test:runtime
       - run: python tests/local_web.py
       - run: npm run build
       - run: npx wrangler pages functions build --outdir=.wrangler/compiled

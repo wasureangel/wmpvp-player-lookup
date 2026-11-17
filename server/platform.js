@@ -18,7 +18,9 @@ export async function remote(url, payload, headers = {}, fetcher = fetch) {
   try {
     response = await fetcher(url, {method:payload === undefined ? 'GET' : 'POST',
       headers:{Accept:'application/json', ...(payload === undefined ? {} : {'Content-Type':'application/json'}), ...headers},
-      body, redirect:'error', signal:AbortSignal.timeout(15000)});
+      // Workers supports only manual/follow. Reject 3xx below instead of
+      // forwarding login credentials to a redirect destination.
+      body, redirect:'manual', signal:AbortSignal.timeout(15000)});
     if (!response.ok) throw new AppError(`${service}返回 HTTP ${response.status}，请稍后重试`, 502);
     text = await response.text();
   } catch (error) {
