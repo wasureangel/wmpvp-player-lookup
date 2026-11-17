@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+__pycache__/
+*.py[cod]
+runtime/
+reports/
+wmpvp_config.json
+*.log
+*.pem
+*.key
+.DS_Store

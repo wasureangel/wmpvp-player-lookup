@@ -1,0 +1,3 @@
+# Replace locally with your own generated values. This example is intentionally invalid.
+SESSION_SECRET=replace-with-64-hex-characters
+SITE_PASSWORD=replace-with-your-private-access-password
