@@ -52,6 +52,16 @@ test('405 diagnostics distinguish declared methods from HTML rejection without r
   }
 });
 
+test('captcha HTML block markers identify the rejecting layer without exposing the page',async()=>{
+  const cookie=await unlock();
+  const result=await handleRequest(request('auth/captcha',{},cookie),env,{fetcher:async()=>new Response(
+    '<html><script src="https://errors.aliyun.com/example"></script>private-cookie</html>',{status:405,headers:{'Content-Type':'text/html'}})});
+  assert.equal(result.status,502);
+  const message=(await result.json()).error;
+  assert.match(message,/阿里云 WAF/);
+  assert.ok(!message.includes('private-cookie'));
+});
+
 test('site gate, same-origin checks and configuration fail closed',async()=>{
   const result=await handleRequest(request('auth/status'),env);
   assert.deepEqual(await result.json(),{accessRequired:true,loggedIn:false,steamId:'',matchesVerified:false});

@@ -1,0 +1,13 @@
+name: Login connectivity diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check official captcha response without login or SMS
+        run: python scripts/diagnose-login.py

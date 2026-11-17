@@ -23,6 +23,22 @@ export async function remote(url, payload, headers = {}, fetcher = fetch) {
       body, redirect:'manual', signal:AbortSignal.timeout(15000)});
     if (!response.ok) {
       if (response.status === 405) {
+        if (target.host === new URL(PASSPORT).host && target.pathname === '/initcaptcha') {
+          const reader=response.body?.getReader();
+          let sample='',size=0;
+          if(reader) try {
+            while(size<32768) {
+              const {done,value}=await reader.read();if(done)break;
+              sample+=new TextDecoder().decode(value.subarray(0,32768-size));size+=value.length;
+            }
+          } finally {await reader.cancel();}
+          // Only known, constant markers leave the server. Never return the HTML.
+          const normalized=sample.toLowerCase();
+          if (normalized.includes('errors.aliyun.com') || normalized.includes('aliyun_waf'))
+            throw new AppError('完美登录入口的阿里云 WAF 安全防护拦截了此请求（HTTP 405）。需要平台方核查防护规则；这不是短信验证码错误',502);
+          if (normalized.includes('your request has been blocked'))
+            throw new AppError('完美登录入口返回了明确的请求拦截页面（HTTP 405）。需要平台方核查拦截原因',502);
+        }
         // Report only protocol metadata, never upstream bodies, cookies or URLs.
         const knownMethods=new Set(['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS']);
         const allow=(response.headers.get('Allow') || '').split(',').map(value=>value.trim().toUpperCase()).filter(value=>knownMethods.has(value));
