@@ -17,6 +17,27 @@ async function unlock() {
   return result.headers.get('Set-Cookie').split(';')[0];
 }
 
+test('captcha failures identify connection, timeout, HTTP and invalid responses without exposing upstream data',async()=>{
+  const cookie=await unlock();
+  const cases=[
+    [async()=>{throw new TypeError('private phone and ticket in URL');},502,'无法连接完美登录服务'],
+    [async()=>{throw new DOMException('private timeout details','TimeoutError');},504,'超时'],
+    [async()=>new Response('private error page',{status:403}),502,'HTTP 403'],
+    [async()=>new Response('<html>private gateway page</html>'),502,'未返回有效数据'],
+  ];
+  for(const [fetcher,status,message] of cases) {
+    const result=await handleRequest(request('auth/captcha',{},cookie),env,{fetcher});
+    assert.equal(result.status,status);
+    const body=await result.json();
+    assert.ok(body.error.startsWith('获取官方验证码失败：'));
+    assert.ok(body.error.includes(message));
+    assert.ok(!body.error.includes('private'));
+  }
+  const success=await handleRequest(request('auth/captcha',{},cookie),env,{fetcher:async()=>json({code:0,capTicket:'test-ticket'})});
+  assert.equal(success.status,200);
+  assert.deepEqual(await success.json(),{capTicket:'test-ticket'});
+});
+
 test('site gate, same-origin checks and configuration fail closed',async()=>{
   const result=await handleRequest(request('auth/status'),env);
   assert.deepEqual(await result.json(),{accessRequired:true,loggedIn:false,steamId:'',matchesVerified:false});

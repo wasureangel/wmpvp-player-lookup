@@ -13,17 +13,36 @@ export async function remote(url, payload, headers = {}, fetcher = fetch) {
   if (target.protocol !== 'https:' || !allowed.has(target.host)) throw new AppError('不支持的查询地址');
   // Preserve exact numeric SteamIDs on the wire without first coercing to Number.
   const body = payload === undefined ? undefined : JSON.stringify(payload).replace(/"(mySteamId|toSteamId)":"(\d{17})"/g,'"$1":$2');
-  const response = await fetcher(url, {method:payload === undefined ? 'GET' : 'POST',
-    headers:{Accept:'application/json', ...(payload === undefined ? {} : {'Content-Type':'application/json'}), ...headers},
-    body, redirect:'error', signal:AbortSignal.timeout(15000)});
-  if (!response.ok) throw new AppError('平台暂时无响应，请稍后重试', 502);
-  const text = await response.text();
+  const service = target.host === new URL(PASSPORT).host ? '完美登录服务' : '完美数据服务';
+  let response, text;
+  try {
+    response = await fetcher(url, {method:payload === undefined ? 'GET' : 'POST',
+      headers:{Accept:'application/json', ...(payload === undefined ? {} : {'Content-Type':'application/json'}), ...headers},
+      body, redirect:'error', signal:AbortSignal.timeout(15000)});
+    if (!response.ok) throw new AppError(`${service}返回 HTTP ${response.status}，请稍后重试`, 502);
+    text = await response.text();
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    if (['TimeoutError','AbortError'].includes(error?.name)) throw new AppError(`连接${service}超时（15 秒），请稍后重试`, 504);
+    // Do not echo upstream exceptions: URLs may contain phone numbers or tickets.
+    throw new AppError(`本站无法连接${service}，请维护者检查 Cloudflare 到官方接口的连接`, 502);
+  }
   // Some upstream responses encode IDs as JSON numbers; keep their original digits.
-  return JSON.parse(text.replace(/("(?:steamId|steamId64|playerId|mySteamId|toSteamId)"\s*:\s*)(\d{17})(?=\s*[,}])/g,'$1"$2"'));
+  try {
+    return JSON.parse(text.replace(/("(?:steamId|steamId64|playerId|mySteamId|toSteamId)"\s*:\s*)(\d{17})(?=\s*[,}])/g,'$1"$2"'));
+  } catch {
+    throw new AppError(`${service}未返回有效数据（HTTP ${response.status}），可能是拦截页面或临时异常`, 502);
+  }
 }
 
 export async function passport(path, payload, fetcher) {
-  const result = await remote(PASSPORT + path, payload, {platform:'APP',appversion:'3.1.0'}, fetcher);
+  let result;
+  try {
+    result = await remote(PASSPORT + path, payload, {platform:'APP',appversion:'3.1.0'}, fetcher);
+  } catch (error) {
+    if (path === '/initcaptcha' && error instanceof AppError) throw new AppError('获取官方验证码失败：' + error.message, error.status);
+    throw error;
+  }
   if (result.code !== 0) throw new AppError('官方验证未通过，请核对输入或稍后重试。');
   return result;
 }
