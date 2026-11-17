@@ -38,6 +38,20 @@ test('captcha failures identify connection, timeout, HTTP and invalid responses 
   assert.deepEqual(await success.json(),{capTicket:'test-ticket'});
 });
 
+test('405 diagnostics distinguish declared methods from HTML rejection without revealing response data',async()=>{
+  const cookie=await unlock();
+  for(const allow of ['', 'POST, private-header-value']) {
+    const result=await handleRequest(request('auth/captcha',{},cookie),env,{fetcher:async()=>new Response('private response body',
+      {status:405,headers:{'Content-Type':'text/html',Allow:allow}})});
+    const body=await result.json();
+    assert.equal(result.status,502);
+    assert.ok(body.error.includes('本站使用 GET'));
+    assert.ok(body.error.includes('HTML 页面'));
+    assert.ok(body.error.includes(allow?'声明支持 POST':'未声明支持的请求方式'));
+    assert.ok(!body.error.includes('private'));
+  }
+});
+
 test('site gate, same-origin checks and configuration fail closed',async()=>{
   const result=await handleRequest(request('auth/status'),env);
   assert.deepEqual(await result.json(),{accessRequired:true,loggedIn:false,steamId:'',matchesVerified:false});

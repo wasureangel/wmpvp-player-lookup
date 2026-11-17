@@ -17,11 +17,21 @@ export async function remote(url, payload, headers = {}, fetcher = fetch) {
   let response, text;
   try {
     response = await fetcher(url, {method:payload === undefined ? 'GET' : 'POST',
-      headers:{Accept:'application/json', ...(payload === undefined ? {} : {'Content-Type':'application/json'}), ...headers},
+      headers:{Accept:'application/json', 'User-Agent':'WMPVP-Player-Lookup/1.0', ...(payload === undefined ? {} : {'Content-Type':'application/json'}), ...headers},
       // Workers supports only manual/follow. Reject 3xx below instead of
       // forwarding login credentials to a redirect destination.
       body, redirect:'manual', signal:AbortSignal.timeout(15000)});
-    if (!response.ok) throw new AppError(`${service}返回 HTTP ${response.status}，请稍后重试`, 502);
+    if (!response.ok) {
+      if (response.status === 405) {
+        // Report only protocol metadata, never upstream bodies, cookies or URLs.
+        const knownMethods=new Set(['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS']);
+        const allow=(response.headers.get('Allow') || '').split(',').map(value=>value.trim().toUpperCase()).filter(value=>knownMethods.has(value));
+        const type=response.headers.get('Content-Type') || '';
+        const format=type.includes('text/html')?'HTML 页面':type.includes('json')?'JSON 数据':'其他格式';
+        throw new AppError(`${service}返回 HTTP 405（本站使用 ${payload === undefined ? 'GET' : 'POST'}；对方${allow.length?'声明支持 '+allow.join('/'):'未声明支持的请求方式'}；返回${format}）。请把此提示反馈给维护者`,502);
+      }
+      throw new AppError(`${service}返回 HTTP ${response.status}，请稍后重试`, 502);
+    }
     text = await response.text();
   } catch (error) {
     if (error instanceof AppError) throw error;

@@ -20,6 +20,8 @@ const runtime=new Miniflare(convertV4MiniflareOptions({modules,modulesRoot:fileU
   outboundService:request=>{
     calls++;
     assert.equal(request.url,'https://passport.pwesports.cn/initcaptcha');
+    assert.equal(request.method,'GET');
+    assert.equal(request.headers.get('User-Agent'),'WMPVP-Player-Lookup/1.0');
     assert.equal(request.headers.get('platform'),'APP');
     if(redirect)return new Response(null,{status:302,headers:{Location:'https://unexpected.example/'}});
     return Response.json({code:0,capTicket:'test-runtime-ticket'});
