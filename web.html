@@ -7,15 +7,10 @@
 <body>
 <header class="site-header"><div class="header-inner"><div class="brand"><span class="brand-mark">CS2</span>玩家查询</div><div class="local"><span class="status-dot"></span>本机运行<span class="header-divider"></span>完美平台数据</div></div></header>
 <main>
-  <div class="page-heading"><h1>玩家表现</h1><p>批量查询玩家，查看最近 10 场表现。</p></div>
+  <div class="page-heading"><h1>玩家表现</h1><p>批量查询玩家，查看最近 10 场逐场战绩。</p></div>
   <div class="workspace">
     <aside class="sidebar">
-      <section id="site-access" class="control-section" hidden>
-        <h2>访问此站点</h2><p class="hint">请输入站点维护者提供的访问口令。解锁后再登录你的完美账号。</p>
-        <label for="site-password">访问口令</label><input id="site-password" type="password" autocomplete="current-password" maxlength="200">
-        <button id="unlock" class="primary full spaced">解锁</button><div id="access-message" class="notice" role="status" aria-live="polite"></div>
-      </section>
-      <section class="control-section query-controls">
+      <section class="control-section">
         <h2>开始查询</h2><label for="mode">输入方式</label>
         <select id="mode" class="full"><option value="names">玩家昵称 · 每行一个</option><option value="status">游戏控制台 status 文本</option></select>
         <label for="players">玩家信息</label><textarea id="players" placeholder="输入玩家昵称，每行一个"></textarea>
@@ -23,8 +18,8 @@
         <button id="query" class="primary full">查询玩家</button><div id="progress" class="notice" role="status" aria-live="polite"></div>
       </section>
       <section class="control-section">
-        <h2>过滤玩家</h2><label for="exclude-players">不显示的玩家昵称</label><textarea id="exclude-players" placeholder="每行一个昵称，回车换行"></textarea>
-        <p id="filter-status" class="hint" role="status">每行一个昵称，完全匹配；清空即可恢复显示。</p>
+        <h2>过滤玩家</h2><label for="exclude-players">跳过查询的玩家昵称</label><textarea id="exclude-players" placeholder="每行一个昵称，回车换行"></textarea>
+        <p id="filter-status" class="hint" role="status">每行一个昵称，完全匹配；点击查询时跳过这些玩家。</p>
       </section>
       <section class="control-section login-section">
         <div class="row between"><h2>账号登录</h2><span id="auth-badge" class="badge">未登录</span></div>
@@ -43,8 +38,8 @@
     </aside>
     <section class="results-panel" aria-labelledby="results-title">
       <div class="result-head"><h2 id="results-title">查询结果</h2><span id="count" class="hint">等待输入玩家</span></div>
-      <div id="results"><div class="empty"><span class="empty-label">近期表现</span><h3>从一个昵称开始</h3><p>在左侧输入玩家昵称，或粘贴游戏控制台的 status 文本。<br>查询后，这里会展示段位与最近 10 场数据。</p><div class="empty-fields"><span>WE</span><span>Rating Pro</span><span>ADR</span><span>K/D</span><span>RWS</span></div></div></div>
-      <details class="query-help"><summary>查询与统计说明</summary><p>同名账号中有近期对局时，隐藏已确认无对局的账号；全部有或全部没有则全部显示。查询失败的保留并提示。模糊匹配需要手动确认。</p><p>下方表现指标取最近 10 场逐场均值，不足 10 场按实际场数计算。当前分和历史分是段位信息，不参与场均计算。历史分会查询官方列出的各个赛季，取返回记录的最高值；接口记录可能不完整。完整历史查询结果在本机内存缓存 10 分钟。</p></details>
+      <div id="results"><div class="empty"><span class="empty-label">近期表现</span><h3>从一个昵称开始</h3><p>在左侧输入玩家昵称，或粘贴游戏控制台的 status 文本。<br>查询后，这里会展示段位与最近 10 场数据。</p><div class="empty-fields"><span>WE</span><span>Rating Pro</span><span>ADR</span><span>K/D/A</span><span>RWS</span></div></div></div>
+      <details class="query-help"><summary>查询与统计说明</summary><p>同名账号中有近期对局时，隐藏已确认无对局的账号；全部有或全部没有则全部显示。查询失败的保留并提示。模糊匹配需要手动确认。</p><p>按由新到旧展示最近 10 场逐场战绩，不足 10 场按实际场数显示。日期使用结束时间，比分按客户端显示顺序排列；胜败按被查询玩家所属队伍判断，平局单独标记。缺失数据用 -- 表示。官匹 Pro 未返回高光标记时，按本场十人数据补全，并列取记录顺序第一位；悬停图标可查看说明。历史分会查询官方列出的各个赛季，取返回记录的最高值；接口记录可能不完整。完整历史查询结果在本机内存缓存 10 分钟。</p></details>
     </section>
   </div>
   <footer class="page-footer">数据来自完美世界竞技平台<span>仅在本机使用</span></footer>

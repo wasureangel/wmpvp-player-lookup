@@ -36,10 +36,6 @@ class WebTests(unittest.TestCase):
         with patch.object(web, 'remote', return_value={'code':1,'result':[{'steamId':'76561198000000000','pvpNickName':'other'}]}):
             self.assertTrue(web.query({'name':'wanted'})['needsChoice'])
 
-    def test_ban_failure_not_clean(self):
-        with patch.object(web, 'remote', return_value={'code':99}):
-            self.assertIn('失败', web.query({'name':'test','steamId':'76561198000000000'})['ban'])
-
     def test_login_hides_token_and_logout_clears(self):
         response = {'result':{'loginResult':{'accountInfo':{'token':'TEST_ONLY_SECRET','steamId':'76561198000000000'}}}}
         with patch.object(web, 'passport', return_value=response), patch.object(web, 'remote', return_value={}):
@@ -78,40 +74,6 @@ class WebTests(unittest.TestCase):
         self.assertIsNone(web.history_peak(None))
         self.assertIsNone(web.history_peak({'score':3000}))
 
-    def test_recent_averages_use_ten_matches_not_season_or_eleventh(self):
-        matches = [dict(team=1, winTeam=1 if i < 6 else 2, kill=20, death=10,
-                        we=8, pwRating=1.2, headShotRatio=.5, adpr=80, rws=10) for i in range(10)]
-        matches[0].update(kill=10, death=20)
-        matches.append(dict(we=999, pwRating=999, adpr=999))
-        result = web.summarize_recent(matches)
-        self.assertEqual(result['games'],10)
-        self.assertAlmostEqual(result['winrate'],.6)
-        self.assertAlmostEqual(result['kd'],1.85)  # Mean of per-match K/D, not summed kills/deaths.
-        self.assertEqual(result['we'],8)
-        self.assertEqual(result['adr'],80)
-        self.assertAlmostEqual(result['rating_pro'],1.2)
-        self.assertEqual(result['headshot'],.5)
-        self.assertEqual(result['rws'],10)
-
-    def test_missing_data_never_becomes_zero_or_partial_average(self):
-        matches = [dict(team=1,winTeam=0,kill=0,death=5,we=0,pwRating=0,adpr=0,rws=0,headShotRatio=0),
-                   dict(team=1,winTeam=1,kill=10,death=0,we=10,pwRating=2)]
-        result = web.summarize_recent(matches)
-        self.assertEqual(result['games'],2)
-        self.assertEqual(result['we'],5)
-        self.assertEqual(result['winrate'],.5)
-        self.assertIsNone(result['adr'])
-        self.assertIsNone(result['kd'])
-        self.assertIsNone(web.summarize_recent([]))
-
-    def test_draws_count_as_losses_in_winrate(self):
-        matches = [dict(team=1, winTeam=winner) for winner in (1, 2, -1, 0)]
-        self.assertEqual(web.summarize_recent(matches)['winrate'], .25)
-        self.assertEqual(web.summarize_recent(matches[2:])['winrate'], 0)
-        for winner in (None, -2, 99, '1'):
-            with self.subTest(winner=winner):
-                self.assertIsNone(web.summarize_recent(matches + [dict(team=1, winTeam=winner)])['winrate'])
-
     def test_detail_selects_id_and_keeps_list_precision(self):
         detail = {'statusCode':0,'data':{'players':[
             {'playerId':'other','adpr':900},
@@ -127,10 +89,10 @@ class WebTests(unittest.TestCase):
         matches = [dict(matchId=f'PVP@{i}',we=5,team=1,winTeam=1) for i in range(11)]
         with patch.object(web.lookup,'match_list',return_value=matches) as listed, \
              patch.object(web,'match_player',side_effect=lambda match,sid: match) as detail:
-            result = web.recent_stats('target',{'steamId':'self','token':'TEST_ONLY'})
+            result = web.recent_matches('target',{'steamId':'self','token':'TEST_ONLY'})
         listed.assert_called_once_with('target','self','TEST_ONLY',page_size=10)
         self.assertEqual(detail.call_count,10)
-        self.assertEqual(result['games'],10)
+        self.assertEqual(len(result),10)
 
     def test_history_does_not_fall_back_to_current_or_scorelist(self):
         with patch.object(web,'remote',return_value={'statusCode':0,'data':{'seasonId':'S25','pvpScore':2500,'scoreList':[{'score':3000}]}}):
@@ -171,5 +133,37 @@ class WebTests(unittest.TestCase):
         self.assertIsNone(result['historySeasonsTotal'])
         with patch.object(web,'remote',return_value={'statusCode':0,'data':{'seasonId':'S25','historyScores':[9999]}}):
             with self.assertRaises(ValueError): web.season_history_peak('target','S15')
+
+    def test_query_returns_individual_games_without_ban_or_summary_queries(self):
+        web.AUTH.update(token='TEST_ONLY',steamId='76561198000000000')
+        def remote(url, payload=None, headers=None):
+            self.assertEqual(url,web.lookup.SEARCH_URL)
+            return {'code':1,'result':[{'steamId':'76561198000000001','pvpNickName':'test','pvpScore':1800}]}
+        records=[{'kill':20,'death':0,'assist':4,'pwRating':1.85,'adpr':115}]
+        with patch.object(web,'remote',side_effect=remote), patch.object(web,'query_history',return_value={}), patch.object(web,'recent_matches',return_value=records) as recent:
+            result=web.query({'name':'test','matches':True})
+        self.assertEqual(result['recentMatches'],records)
+        self.assertNotIn('stats',result)
+        self.assertNotIn('ban',result)
+        recent.assert_called_once()
+
+    def test_detail_keeps_zero_and_fills_honors_for_correct_player(self):
+        detail={'statusCode':0,'data':{'players':[{'playerId':'other','honor':'1'},{'playerId':'target','honor':'5,2','assist':4,'adpr':70,'rws':8,'pwRating':1.2,'mvp':False}]}}
+        with patch.object(web,'remote',return_value=detail):
+            result=web.match_player({'matchId':'PVP@123','kill':0,'death':0,'pwRating':0},'target')
+        self.assertEqual(result['honor'],'5,2')
+        self.assertEqual(result['assist'],4)
+        self.assertEqual(result['pwRating'],0)
+        self.assertNotIn('headShotRatio',result)
+
+    def test_records_whitelist_and_detail_failure_preserve_matches(self):
+        raw={'matchId':'PVP@1','kill':5,'honor':'5','token':'SECRET','headShotRatio':.5}
+        with patch.object(web.lookup,'match_list',return_value=[raw]), patch.object(web,'remote',side_effect=RuntimeError()):
+            records=web.recent_matches('target',{'steamId':'self','token':'TEST'})
+        self.assertEqual(len(records),1)
+        self.assertEqual(records[0]['kill'],5)
+        self.assertIsNone(records[0]['adpr'])
+        self.assertNotIn('token',records[0])
+        self.assertNotIn('headShotRatio',records[0])
 
 unittest.main()
