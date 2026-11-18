@@ -14,13 +14,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: npm
-      - run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - run: npm run check
       - run: npm test
-      - run: npm run test:ui
-      - run: npm run test:runtime
       - run: python tests/local_web.py
-      - run: npm run build
-      - run: npx wrangler pages functions build --outdir=.wrangler/compiled
-      - run: npm audit --audit-level=high

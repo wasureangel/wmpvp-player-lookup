@@ -5,42 +5,9 @@ let busy = false, captcha = null, captchaTicket = '', smsUntil = 0;
 async function api(path, data = {}) {
   const response = await fetch('/api/' + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-App-Token': document.querySelector('meta[name="app-token"]').content}, body: JSON.stringify(data)});
   const value = await response.json();
-  if (!response.ok) { if (value.accessRequired) authView(value); throw new Error(value.error || '请求失败'); }
-  if (path === 'query' && value.historyPending) Object.assign(value, await loadHistory(value.steamId));
-  if (path === 'query' && value.steamId && value.stats && !Object.prototype.hasOwnProperty.call(value, 'officialRank')) {
-    // Reuse the authenticated inspection endpoint without restarting the local service.
-    // This read is optional: it must never discard otherwise successful player results.
-    value.officialRank = null;
-    try {
-      const matches = await api('match-ranks', {steamId: value.steamId});
-      value.officialRank = latestOfficialRank(matches.records);
-      // Older running servers reject the -1 draw marker. Use the same ten-match
-      // record list to fill only a missing win rate without clearing the login.
-      if (value.stats.winrate === null) value.stats.winrate = recentWinrate(matches.records, value.stats.games);
-    } catch (_) { /* No verified score: leave the badge absent. */ }
-  }
+  if (!response.ok) throw new Error(value.error || '请求失败');
+  if (path === 'query') value.officialRank = latestOfficialRank(value.recentMatches);
   return value;
-}
-async function loadHistory(steamId) {
-  let peak=null,checked=0,total=null,offset=0,complete=false;
-  try {
-    for(let page=0;page<25;page++) {
-      const batch=await api('history',{steamId,offset});
-      if(typeof batch.peak==='number'&&Number.isFinite(batch.peak)) peak=peak===null?batch.peak:Math.max(peak,batch.peak);
-      checked+=batch.checked;total=batch.total;
-      if(batch.nextOffset===null){complete=checked===total;break;}
-      if(!Number.isInteger(batch.nextOffset)||batch.nextOffset<=offset)break;
-      offset=batch.nextOffset;
-    }
-  } catch { /* Preserve verified earlier batches and report incomplete coverage. */ }
-  return {historyPeakScore:peak,historySeasonsChecked:checked,historySeasonsTotal:total,
-    historyRankState:complete?(peak===null?'empty':'available'):(checked?'partial':'unavailable')};
-}
-function recentWinrate(records, games) {
-  if (!Array.isArray(records) || !Number.isInteger(games) || games < 1 || games > 10) return null;
-  const recent = records.slice(0, 10);
-  if (recent.length !== games || recent.some(match => !match || ![1, 2].includes(match.team) || ![-1, 0, 1, 2].includes(match.winTeam))) return null;
-  return recent.filter(match => match.team === match.winTeam).length / recent.length;
 }
 function latestOfficialRank(records) {
   if (!Array.isArray(records)) return null;
@@ -62,35 +29,20 @@ function rankForScore(score) {
   return tier ? {label:tier[1],icon:tier[2]} : {label:'S',icon:'S'};
 }
 function excludedNames() { return new Set($('exclude-players').value.split(/\r?\n/).map(name => name.trim()).filter(Boolean)); }
-function updateVisibility() {
-  const excluded = excludedNames(); let hidden = 0;
-  for (const [name, row] of rows) {
-    const article = $('results').querySelector('[data-index="' + row.index + '"]');
-    if (article) article.hidden = excluded.has(name);
-    if (excluded.has(name)) hidden++;
-  }
-  $('filter-status').textContent = excluded.size ? `已设置 ${excluded.size} 个过滤昵称；当前隐藏 ${hidden} 组结果。` : '每行一个昵称，完全匹配；清空即可恢复显示。';
-  if (rows.size) $('count').textContent = `${rows.size} 个昵称 · 显示 ${rows.size - hidden} 组，过滤 ${hidden} 组`;
+function updateFilterStatus() {
+  const excluded = excludedNames();
+  $('filter-status').textContent = excluded.size ? `已设置 ${excluded.size} 个过滤昵称；下次查询时直接跳过，不影响已有结果。` : '每行一个昵称，完全匹配；点击查询时跳过这些玩家。';
 }
-$('exclude-players').addEventListener('input', updateVisibility);
+$('exclude-players').addEventListener('input', updateFilterStatus);
 function authView(data) {
-  const locked=!!data.accessRequired;
-  $('site-access').hidden=!locked;
-  $('query').disabled=busy||locked;
-  $('auth-badge').textContent = locked ? '站点未解锁' : data.loggedIn ? '已登录' : '未登录';
-  $('login-form').hidden = locked || data.loggedIn; $('logged-in').hidden = locked || !data.loggedIn;
+  $('auth-badge').textContent = data.loggedIn ? '已登录' : '未登录';
+  $('login-form').hidden = data.loggedIn; $('logged-in').hidden = !data.loggedIn;
   $('my-steamid').value = data.steamId || '';
   $('manual-account').hidden = Boolean(data.steamId);
   $('account').textContent = data.matchesVerified ? '战绩接口已验证，可查询近期表现。' : '官方登录已完成，战绩权限尚未验证。';
 }
-$('unlock').addEventListener('click', async () => {
-  $('unlock').disabled=true;
-  try { authView(await api('access/unlock',{password:$('site-password').value})); $('site-password').value=''; message('access-message',''); }
-  catch(e){message('access-message',e.message,true);}
-  finally{$('unlock').disabled=false;}
-});
 function selectRecentPlayers(players) {
-  const hasRecent = players.some(player => player.stats && player.stats.games > 0);
+  const hasRecent = players.some(player => Array.isArray(player.recentMatches) && player.recentMatches.length > 0);
   // Only a successful empty response proves there are no recent matches.
   return hasRecent ? players.filter(player => player.matchMessage !== '近期无对局记录') : players;
 }
@@ -170,47 +122,87 @@ function appendPlayerStats(container, data) {
   if (data.historyRankState === 'partial') card.append(node('p', '部分历史赛季未能查到，历史分数仅基于已返回记录，可稍后重查。', 'data-notice'));
   if (data.historyRankState === 'unavailable') card.append(node('p', '历史分数查询暂时失败，可稍后重查。', 'data-notice'));
   if (data.historyRankState === 'empty') card.append(node('p', '已查询的赛季中没有可用的历史分数记录。', 'data-notice'));
-  if (data.stats) {
-    const s = data.stats, body = node('div', '', 'performance');
-    const featured = node('div', '', 'featured-metrics');
-    featured.append(metric('WE 制胜评价', s.we, 1, '', true), metric('Rating Pro', s.rating_pro, 2, '', true));
-    const grid = node('div', '', 'metric-grid');
-    grid.append(metric('场次', s.games, 0), metric('胜率', s.winrate, 1, '%'),
-      metric('爆头率', s.headshot, 1, '%'), metric('ADR', s.adr, 1),
-      metric('K/D', s.kd, 2), metric('RWS', s.rws, 2));
-    body.append(featured, grid); card.append(body);
-    const note = node('div', '', 'sample-note');
-    note.append(node('span', `最近 ${s.games} 场${s.games < 10 ? ' · 不足 10 场，按实际场数统计' : '比赛'}`));
-    note.append(node('span', '表现指标为逐场均值；胜率按胜场计算'));
-    card.append(note);
-    if (['we','rating_pro','headshot','adr','kd','rws','winrate'].some(key => !Number.isFinite(s[key]))) {
-      card.append(node('p', '部分比赛的数据缺失或无法计算，对应指标显示 --。', 'data-notice'));
-    }
-  }
+  const recent = Array.isArray(data.recentMatches) ? data.recentMatches.slice(0, 10) : [];
+  if (recent.length) card.append(matchTable(recent, displayName));
   if (data.matchMessage) card.append(node('p', data.matchMessage, 'data-notice'));
-  if (!data.stats && !data.matchMessage) card.append(node('p', '暂未取得近期战绩。', 'data-notice'));
+  if (!recent.length && !data.matchMessage) card.append(node('p', '暂未取得近期战绩。', 'data-notice'));
   container.append(card);
 }
-function metric(label, value, decimals, suffix = '', featured = false) {
-  const item = node('div', '', featured ? 'featured-metric' : 'metric');
-  const valid = typeof value === 'number' && Number.isFinite(value);
-  item.append(node('span', label, 'metric-label'));
-  const number = node('div', '', featured ? 'metric-ring' : 'metric-number');
-  const threshold = label === 'Rating Pro' ? 1 : label === '胜率' ? 0.5 : null;
-  if (valid && threshold !== null && value !== threshold) {
-    number.className += value < threshold ? ' metric-below' : ' metric-above';
+function matchNumber(value, decimals = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '--';
+  return (Math.round((value + Number.EPSILON * Math.max(1, value)) * 10 ** decimals) / 10 ** decimals).toFixed(decimals);
+}
+function matchOutcome(match) {
+  if (![1, 2].includes(match.team)) return ['--', 'unknown'];
+  if ([-1, 0].includes(match.winTeam)) return ['平', 'draw'];
+  if (![1, 2].includes(match.winTeam)) return ['--', 'unknown'];
+  return match.team === match.winTeam ? ['胜', 'win'] : ['负', 'loss'];
+}
+function matchLevel(match) {
+  if (match.mode === '完美官匹Pro' || officialRankTier(match.pvpNormalRank)) {
+    const tier = officialRankTier(match.pvpNormalRank);
+    const badge = node('span', '', 'official-score match-official tier-' + (tier || 'unknown'));
+    badge.append(node('strong', tier ? match.pvpNormalRank.toLocaleString('en-US') : '---'));
+    badge.title = tier ? '该场记录的官匹分' : '该场未返回官匹分';
+    return badge;
   }
-  if (featured) { const ring = node('span', '', 'ring-decoration'); ring.setAttribute('aria-hidden', 'true'); number.append(ring); }
-  const scaled = value * (suffix === '%' ? 100 : 1);
-  const rounded = Math.round((scaled + Number.EPSILON * Math.max(1, Math.abs(scaled))) * 10 ** decimals) / 10 ** decimals;
-  number.append(node('strong', valid ? rounded.toFixed(decimals) : '--'));
-  if (valid && suffix) number.append(node('small', suffix));
-  item.append(number);
-  const explanations = {'ADR':'逐场平均每回合伤害的均值', 'K/D':'逐场击杀数 ÷ 死亡数的均值；有零死亡或缺失数据时暂不计算',
-    'RWS':'逐场 RWS（回合胜利贡献）的均值', '爆头率':'逐场爆头率的均值', 'WE 制胜评价':'逐场 WE 评价的均值',
-    'Rating Pro':'逐场完美 Rating Pro 的均值', '场次':'本次统计的最近比赛数量，最多 10 场', '胜率':'胜场数 ÷ 本次统计场数；平局按输计算，计入总场数'};
-  item.title = explanations[label]; item.tabIndex = 0;
-  return item;
+  const rank = rankForScore(match.pvpScore);
+  if (!rank.icon) return node('span', '--', 'muted');
+  const level = node('span', '', 'match-ladder');
+  level.append(rankBadge(rank));
+  level.title = `${rank.label} · ${match.pvpScore === 0 ? '未定级' : match.pvpScore + ' 分'}`;
+  return level;
+}
+function matchHighlights(match) {
+  // Official honor codes; use recorded awards, never infer from kill counts.
+  const honors = {'1':['MVP','MVP 之最'], '2':['准','精准之最'], '3':['狙','狙击之最'],
+    '4':['突','突破之最'], '5':['残','残局获胜最多'], '6':['闪','闪白之最'], '7':['助','助攻之最']};
+  const ids = new Set((typeof match.honor === 'string' ? match.honor.split(',') : []).map(id => id.trim()));
+  if (match.mvp === true || match.pvpMvp === true) ids.add('1');
+  const list = node('div', '', 'match-highlights');
+  for (const id of ['1','2','3','4','5','7','6']) {
+    if (!ids.has(id)) continue;
+    const [label, title] = honors[id], badge = node('span', label, 'highlight honor-' + id);
+    badge.title = title; badge.setAttribute('aria-label', title); badge.tabIndex = 0; list.append(badge);
+    if (Array.isArray(match.derivedHonors) && match.derivedHonors.includes(id)) badge.title += '；原高光标记缺失，按本场十人数据补全，并列取记录顺序第一位';
+  }
+  if (!list.children.length) list.append(node('span', '--', 'muted'));
+  return list;
+}
+function matchTable(matches, displayName) {
+  const wrap = node('div', '', 'match-table-wrap');
+  wrap.tabIndex = 0; wrap.setAttribute('role', 'region'); wrap.setAttribute('aria-label', `${displayName}的近十场战绩，可横向滚动`);
+  const table = node('table', '', 'match-table');
+  table.append(node('caption', `最近 ${matches.length} 场比赛${matches.length < 10 ? ' · 不足 10 场' : ''}`));
+  const head = node('thead', ''), headings = node('tr', '');
+  for (const title of ['日期','类型','胜/败','比分','K/D/A','ADR','RWS','RATING PRO','WE','级别','高光']) {
+    const th = node('th', title); th.setAttribute('scope', 'col'); headings.append(th);
+  }
+  head.append(headings); table.append(head);
+  const body = node('tbody', '');
+  for (const match of matches) {
+    const tr = node('tr', '');
+    const displayedTime = match.endTime || match.startTime;
+    const time = typeof displayedTime === 'string' ? displayedTime.match(/^\d{4}-(\d{2})-(\d{2})[ T](\d{2}:\d{2})/) : null;
+    const date = node('td', time ? `${time[1]}/${time[2]} ${time[3]}` : '--', 'match-date'); date.title = `${match.endTime ? '结束时间' : '开始时间（结束时间缺失）'}：${displayedTime || '--'}`;
+    const type = node('td', '', 'match-type'), typeInner = node('span', '', 'match-mode');
+    if (typeof match.mapLogo === 'string' && /^https:\/\//i.test(match.mapLogo)) {
+      const logo = node('img', '', 'match-map'); logo.src = match.mapLogo; logo.alt = ''; logo.title = match.mapName || '';
+      logo.loading = 'lazy'; logo.referrerPolicy = 'no-referrer'; logo.addEventListener('error', () => logo.remove()); typeInner.append(logo);
+    }
+    typeInner.append(node('span', match.mode || '--')); type.append(typeInner);
+    const [outcome, state] = matchOutcome(match), outcomeCell = node('td', ''); outcomeCell.append(node('span', outcome, 'match-outcome ' + state));
+    // Client reference rows show team 2 : team 1; outcome still uses team IDs.
+    const score = node('td', `${matchNumber(match.score2)} : ${matchNumber(match.score1)}`); score.title = '队伍 2 : 队伍 1（客户端显示顺序）';
+    const kda = node('td', [match.kill, match.death, match.assist].map(v => matchNumber(v)).join('/'));
+    const rating = node('td', matchNumber(match.pwRating, 2));
+    if (typeof match.pwRating === 'number' && Number.isFinite(match.pwRating) && match.pwRating >= 0 && match.pwRating !== 1) rating.className = match.pwRating < 1 ? 'metric-below' : 'metric-above';
+    const level = node('td', '', 'match-level'); level.append(matchLevel(match));
+    const highlights = node('td', ''); highlights.append(matchHighlights(match));
+    tr.append(date, type, outcomeCell, score, kda, node('td', matchNumber(match.adpr)), node('td', matchNumber(match.rws, 2)), rating,
+      node('td', matchNumber(match.we, 1), 'match-we'), level, highlights); body.append(tr);
+  }
+  table.append(body); wrap.append(table); return wrap;
 }
 function render(name, data) {
   const article = $('results').querySelector('[data-index="' + rows.get(name).index + '"]');
@@ -233,6 +225,11 @@ function render(name, data) {
     for (const candidate of data.candidates) {
       const button = node('button', candidate.pvpNickName, 'candidate');
       button.addEventListener('click', async () => {
+        const excluded = excludedNames();
+        if (excluded.has(name) || excluded.has(candidate.pvpNickName)) {
+          message('progress', `已跳过「${candidate.pvpNickName}」：该玩家在过滤名单中。`);
+          return;
+        }
         article.querySelectorAll('button').forEach(b => b.disabled = true);
         try {
           const result = await api('query', {name: candidate.pvpNickName, steamId: candidate.steamId, matches: true});
@@ -248,9 +245,18 @@ function render(name, data) {
 $('mode').addEventListener('change', () => $('players').placeholder = $('mode').value === 'status' ? '粘贴游戏控制台 status 的完整输出' : '输入玩家昵称，每行一个');
 $('query').addEventListener('click', async () => {
   if (busy) return; busy = true; $('query').disabled = true;
+  const excluded = excludedNames();
+  $('exclude-players').disabled = true;
   try {
-    const {names} = await api('parse', {mode: $('mode').value, text: $('players').value});
+    const {names: parsedNames} = await api('parse', {mode: $('mode').value, text: $('players').value});
+    const names = parsedNames.filter(name => !excluded.has(name));
+    const skipped = parsedNames.length - names.length;
     rows.clear(); $('results').replaceChildren();
+    $('count').textContent = `查询 ${names.length} 个昵称 · 已跳过 ${skipped} 个`;
+    if (!names.length) {
+      message('progress', `输入的 ${skipped} 个昵称均在过滤名单中，本次未查询任何玩家。`);
+      return;
+    }
     for (const [index, name] of names.entries()) {
       rows.set(name, {index, data: {name}});
       const article = node('article', '', 'player'); article.dataset.index = index;
@@ -261,7 +267,6 @@ $('query').addEventListener('click', async () => {
       skeleton.append(node('span', ''), node('span', ''), node('span', '')); waiting.append(skeleton);
       article.append(waiting); $('results').append(article);
     }
-    updateVisibility();
     for (const [index, name] of names.entries()) {
       message('progress', `正在查询 ${index + 1} / ${names.length}：${name}（包含历史赛季，首次查询稍慢）`);
       let result;
@@ -270,10 +275,9 @@ $('query').addEventListener('click', async () => {
       rows.get(name).data = result; render(name, result);
       if (index < names.length - 1) await new Promise(resolve => setTimeout(resolve, 600));
     }
-    updateVisibility();
-    message('progress', '本批查询结束，请查看结果与需要确认的玩家。');
+    message('progress', `本批查询结束，已查询 ${names.length} 个昵称，跳过 ${skipped} 个。请查看结果与需要确认的玩家。`);
   } catch (e) { message('progress', e.message, true); }
-  finally { busy = false; $('query').disabled = false; }
+  finally { busy = false; $('query').disabled = false; $('exclude-players').disabled = false; updateFilterStatus(); }
 });
 function loadScript(src) { return new Promise((resolve, reject) => { const script = document.createElement('script'); script.src = src; script.onload = resolve; script.onerror = () => { script.remove(); reject(new Error('官方验证组件加载失败，请稍后重试')); }; document.head.append(script); }); }
 $('send-code').addEventListener('click', async () => {
@@ -305,6 +309,6 @@ $('login').addEventListener('click', async () => {
   finally { $('login').disabled = false; }
 });
 $('verify').addEventListener('click', async () => { $('verify').disabled = true; try { authView(await api('auth/steamid', {steamId: $('my-steamid').value.trim()})); message('auth-message', '战绩权限验证成功。'); } catch (e) { message('auth-message', e.message, true); } finally { $('verify').disabled = false; } });
-$('logout').addEventListener('click', async () => { try { authView(await api('auth/logout')); message('auth-message', '已退出当前登录。'); } catch (e) { message('auth-message', e.message, true); } });
+$('logout').addEventListener('click', async () => { try { authView(await api('auth/logout')); message('auth-message', '已清除本机内存中的登录凭据。'); } catch (e) { message('auth-message', e.message, true); } });
 api('auth/status').then(authView).catch(e => message('auth-message', e.message, true));
 })();

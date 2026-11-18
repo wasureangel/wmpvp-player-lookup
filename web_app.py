@@ -135,9 +135,43 @@ def query_history(sid):
     return result
 
 
+def honor_ids(value):
+    """Normalize the official honor IDs; empty or unknown codes add no badge."""
+    if isinstance(value, str):
+        values = value.split(',')
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+    return [code for item in values if (code := str(item).strip()) in ('1', '2', '3', '4', '5', '6', '7')]
+
+
+def missing_pro_honors(players, sid):
+    """Fallback matched against eight client rows when all Pro honors are null.
+
+    Select the first maximum in API player order, not every tied player. Only
+    complete ten-player numeric data can establish an award; zero earns none.
+    """
+    if len(players) != 10 or len({str(p.get('playerId')) for p in players}) != 10:
+        return []
+    if any(honor_ids(p.get('honor')) for p in players):
+        return []
+    awards = []
+    for code, key in [('2', 'headShot'), ('3', 'snipeNum'), ('4', 'entryKill'),
+                      ('5', 'endGame'), ('6', 'flashSuccess'), ('7', 'assist')]:
+        values = [score_value(p.get(key)) for p in players]
+        if any(v is None for v in values) or max(values) <= 0:
+            continue
+        winner = players[values.index(max(values))]
+        if str(winner.get('playerId')) == sid:
+            awards.append(code)
+    return awards
+
+
 def match_player(match, sid):
     """Enrich one listed match, always selecting the player by ID, never nickname."""
     result = dict(match)
+    result['honor'] = ','.join(dict.fromkeys(honor_ids(match.get('honor'))))
     match_id = str(match.get('matchId') or '')
     if not re.fullmatch(r'[A-Za-z0-9@_-]{1,80}', match_id):
         return result
@@ -148,45 +182,39 @@ def match_player(match, sid):
         detail = response.get('data')
         if response.get('statusCode') != 0 or not isinstance(detail, dict):
             return result
-        player = next((p for p in detail.get('players', [])
+        players = detail.get('players') or []
+        player = next((p for p in players
                        if str(p.get('playerId')) == sid), None)
         if player:
             # Prefer the match-list WE precision; fill only the known detail fields.
-            for key in ('we', 'pwRating', 'headShotRatio', 'adpr', 'rws', 'kill', 'death'):
+            for key in ('we', 'pwRating', 'adpr', 'rws', 'kill', 'death', 'assist'):
                 if score_value(result.get(key)) is None:
                     result[key] = player.get(key)
+            # The list may contain only a subset (e.g. "1"); detail contains
+            # the remaining awards. A nonempty list value must not hide them.
+            result['honor'] = ','.join(dict.fromkeys(
+                honor_ids(result.get('honor')) + honor_ids(player.get('honor'))))
+            if match.get('mode') == '完美官匹Pro':
+                derived = missing_pro_honors(players, sid)
+                if derived:
+                    result['honor'] = ','.join(dict.fromkeys(honor_ids(result['honor']) + derived))
+                    result['derivedHonors'] = derived
+            for key in ('mvp', 'pvpMvp'):
+                result[key] = result.get(key) is True or player.get(key) is True
     except Exception:
         pass  # Missing detail must never erase the confirmed match or become zero.
     return result
 
 
-def summarize_recent(matches):
-    recent = matches[:10]
-    if not recent:
-        return None
-    def mean(values):
-        checked = [score_value(v) for v in values]
-        return sum(checked) / len(checked) if all(v is not None for v in checked) else None
-    outcomes = [int(m['team'] == m['winTeam'])
-                if m.get('team') in (1, 2) and m.get('winTeam') in (-1, 0, 1, 2) else None
-                for m in recent]
-    kd = [m['kill'] / m['death'] if score_value(m.get('kill')) is not None
-          and score_value(m.get('death')) is not None and m['death'] > 0 else None for m in recent]
-    stats = {'games': len(recent), 'winrate': mean(outcomes), 'kd': mean(kd)}
-    for target, source in [('we', 'we'), ('rating_pro', 'pwRating'),
-                           ('headshot', 'headShotRatio'), ('adr', 'adpr'), ('rws', 'rws')]:
-        values = [m.get(source) for m in recent]
-        if target == 'headshot':
-            values = [v if score_value(v) is not None and v <= 1 else None for v in values]
-        stats[target] = mean(values)
-    return stats
-
-
-def recent_stats(sid, auth):
+def recent_matches(sid, auth):
+    """Fetch ten individual games once; details supply ADR, RWS and honors."""
     matches = lookup.match_list(sid, auth['steamId'], auth['token'], page_size=10)[:10]
     with ThreadPoolExecutor(max_workers=3) as pool:
         enriched = list(pool.map(lambda match: match_player(match, sid), matches))
-    return summarize_recent(enriched)
+    keys = ('startTime', 'endTime', 'mode', 'mapName', 'mapLogo', 'team', 'winTeam', 'score1', 'score2',
+            'kill', 'death', 'assist', 'adpr', 'rws', 'pwRating', 'we', 'pvpScore',
+            'pvpNormalRank', 'honor', 'derivedHonors', 'mvp', 'pvpMvp')
+    return [{key: match.get(key) for key in keys} for match in enriched]
 
 
 def query(data):
@@ -223,17 +251,7 @@ def query(data):
             pass
     if not re.fullmatch(r'\d{17}', sid):
         raise ValueError('SteamID64 应为 17 位数字')
-    row = {'name': name, **picked, 'ban': '查询失败', 'stats': None, 'matchMessage': ''}
-    try:
-        response = remote(lookup.FORBID_URL + '?game_abbr_list=PVP,CSGO&uid_list=' + sid)
-        body = response.get('data')
-        if not isinstance(body, dict) or not isinstance(body.get('list'), list):
-            raise ValueError('封禁接口返回异常')
-        bans = [b for b in body['list'] if str(b.get('steam_id64')) == sid]
-        row['ban'] = '; '.join(str(lookup.FORBID_TYPE.get(str(b.get('forbid_type')), '封禁类型未知'))
-                              + f"（{int(b.get('forbid_seconds') or 0) // 86400} 天）" for b in bans) if bans else '未发现公示记录'
-    except Exception:
-        row['ban'] = '封禁查询失败，请重试'
+    row = {'name': name, **picked, 'recentMatches': None, 'matchMessage': ''}
     row['historyPeakScore'] = None
     row['historyRankState'] = 'unavailable'
     try:
@@ -247,8 +265,8 @@ def query(data):
             row['matchMessage'] = '请先登录并确认自己的 SteamID'
         else:
             try:
-                row['stats'] = recent_stats(sid, auth)
-                row['matchMessage'] = '' if row['stats'] else '近期无对局记录'
+                row['recentMatches'] = recent_matches(sid, auth)
+                row['matchMessage'] = '' if row['recentMatches'] else '近期无对局记录'
                 with LOCK:
                     if AUTH.get('token') == auth['token']:
                         AUTH['matchesVerified'] = True
