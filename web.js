@@ -1,12 +1,13 @@
 (() => {
 const $ = id => document.getElementById(id);
 const rows = new Map();
-let busy = false, captcha = null, captchaTicket = '', smsUntil = 0;
-async function api(path, data = {}) {
-  const response = await fetch('/api/' + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-App-Token': document.querySelector('meta[name="app-token"]').content}, body: JSON.stringify(data)});
+let generation = 0;
+const sessions = new Set();
+let captcha = null, captchaTicket = '', smsUntil = 0;
+async function api(path, data = {}, signal) {
+  const response = await fetch('/api/' + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-App-Token': document.querySelector('meta[name="app-token"]').content}, signal, body: JSON.stringify(data)});
   const value = await response.json();
   if (!response.ok) throw new Error(value.error || '请求失败');
-  if (path === 'query') value.officialRank = latestOfficialRank(value.recentMatches);
   return value;
 }
 function latestOfficialRank(records) {
@@ -40,28 +41,6 @@ function authView(data) {
   $('my-steamid').value = data.steamId || '';
   $('manual-account').hidden = Boolean(data.steamId);
   $('account').textContent = data.matchesVerified ? '战绩接口已验证，可查询近期表现。' : '官方登录已完成，战绩权限尚未验证。';
-}
-function selectRecentPlayers(players) {
-  const hasRecent = players.some(player => Array.isArray(player.recentMatches) && player.recentMatches.length > 0);
-  // Only a successful empty response proves there are no recent matches.
-  return hasRecent ? players.filter(player => player.matchMessage !== '近期无对局记录') : players;
-}
-async function resolveDuplicates(name, result) {
-  if (!result.needsChoice || result.candidates.length < 2 || !result.candidates.every(candidate => candidate.pvpNickName === name)) return result;
-  const candidates = [...new Map(result.candidates.map(candidate => [candidate.steamId, candidate])).values()];
-  const players = [];
-  for (const [index, candidate] of candidates.entries()) {
-    message('progress', `正在检查「${name}」的同名账号 ${index + 1} / ${candidates.length}`);
-    try {
-      players.push(await api('query', {name, steamId: candidate.steamId, matches: true}));
-    } catch (e) {
-      players.push({name, error: '近期对局查询失败：' + e.message});
-    }
-    if (index < candidates.length - 1) await new Promise(resolve => setTimeout(resolve, 600));
-  }
-  const selected = selectRecentPlayers(players);
-  const filtered = players.length - selected.length;
-  return {name, players: selected, message: `找到 ${players.length} 个同名账号，显示 ${selected.length} 个` + (filtered ? `；已筛掉 ${filtered} 个无近期对局的账号。` : '。')};
 }
 function rankBadge(rank) {
     const badge = node('span', '', 'rank-icon');
@@ -103,7 +82,7 @@ function appendPlayerStats(container, data) {
     official.title = `近 10 场中最新有值的记录${data.officialRank.time ? '：' + data.officialRank.time : ''}${data.officialRank.mode ? ' · ' + data.officialRank.mode : ''}；不代表实时分数`;
     official.tabIndex = 0; ranks.append(official); header.classList.add('has-official-rank');
   }
-  for (const [label, score, historical] of [['天梯历史', data.historyPeakScore, true], ['天梯当前', data.pvpScore, false]]) {
+  function rankBlock(label, score, historical) {
     const rank = rankForScore(score), block = node('div', '', 'rank-block');
     if (historical) {
       const coverage = data.historySeasonsTotal ? `已查询 ${data.historySeasonsChecked} / ${data.historySeasonsTotal} 个赛季。` : '';
@@ -115,18 +94,31 @@ function appendPlayerStats(container, data) {
       if (historical) badge.className = 'rank-icon history-rank';
       line.append(badge);
     }
-    line.append(node('strong', rank.icon ? (score === 0 ? '未定级' : String(score)) : '--'));
-    block.append(line, node('span', label, 'rank-caption')); ranks.append(block);
+    line.append(node('strong', rank.icon ? (score === 0 ? '未定级' : String(score)) : (historical && data.historyRankState === 'pending' ? '加载中…' : '--')));
+    block.append(line, node('span', label, 'rank-caption')); return block;
   }
+  const history = node('div', '', 'rank-slot');
+  history.append(rankBlock('天梯历史', data.historyPeakScore, true));
+  ranks.append(history, rankBlock('天梯当前', data.pvpScore, false));
   header.append(ranks); card.append(header);
-  if (data.historyRankState === 'partial') card.append(node('p', '部分历史赛季未能查到，历史分数仅基于已返回记录，可稍后重查。', 'data-notice'));
-  if (data.historyRankState === 'unavailable') card.append(node('p', '历史分数查询暂时失败，可稍后重查。', 'data-notice'));
-  if (data.historyRankState === 'empty') card.append(node('p', '已查询的赛季中没有可用的历史分数记录。', 'data-notice'));
+  const notice = node('p', '', 'data-notice');
+  card.append(notice);
+  function updateHistory(patch) {
+    Object.assign(data, patch);
+    history.replaceChildren(rankBlock('天梯历史', data.historyPeakScore, true));
+    const notices = {partial:'部分历史赛季未能查到，历史分数仅基于已返回记录，可稍后重查。',
+      unavailable:'历史分数查询暂时失败，可稍后重查。', empty:'已查询的赛季中没有可用的历史分数记录。'};
+    notice.textContent = notices[data.historyRankState] || '';
+    notice.hidden = !notice.textContent;
+  }
+  updateHistory({});
   const recent = Array.isArray(data.recentMatches) ? data.recentMatches.slice(0, 10) : [];
-  if (recent.length) card.append(matchTable(recent, displayName));
+  const updates = [];
+  if (recent.length) card.append(matchTable(recent, displayName, updates));
   if (data.matchMessage) card.append(node('p', data.matchMessage, 'data-notice'));
   if (!recent.length && !data.matchMessage) card.append(node('p', '暂未取得近期战绩。', 'data-notice'));
   container.append(card);
+  return {history: updateHistory, detail: (position, patch) => updates[position]?.(patch)};
 }
 function matchNumber(value, decimals = 0) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '--';
@@ -166,10 +158,12 @@ function matchHighlights(match) {
     badge.title = title; badge.setAttribute('aria-label', title); badge.tabIndex = 0; list.append(badge);
     if (Array.isArray(match.derivedHonors) && match.derivedHonors.includes(id)) badge.title += '；原高光标记缺失，按本场十人数据补全，并列取记录顺序第一位';
   }
-  if (!list.children.length) list.append(node('span', '--', 'muted'));
+  if (match.detailState === 'pending' || match.detailState === 'unavailable') {
+    list.append(node('span', match.detailState === 'pending' ? '加载中…' : '详情未取得', 'muted'));
+  } else if (!list.children.length) list.append(node('span', '--', 'muted'));
   return list;
 }
-function matchTable(matches, displayName) {
+function matchTable(matches, displayName, updates = []) {
   const wrap = node('div', '', 'match-table-wrap');
   wrap.tabIndex = 0; wrap.setAttribute('role', 'region'); wrap.setAttribute('aria-label', `${displayName}的近十场战绩，可横向滚动`);
   const table = node('table', '', 'match-table');
@@ -194,90 +188,164 @@ function matchTable(matches, displayName) {
     const [outcome, state] = matchOutcome(match), outcomeCell = node('td', ''); outcomeCell.append(node('span', outcome, 'match-outcome ' + state));
     // Client reference rows show team 2 : team 1; outcome still uses team IDs.
     const score = node('td', `${matchNumber(match.score2)} : ${matchNumber(match.score1)}`); score.title = '队伍 2 : 队伍 1（客户端显示顺序）';
-    const kda = node('td', [match.kill, match.death, match.assist].map(v => matchNumber(v)).join('/'));
-    const rating = node('td', matchNumber(match.pwRating, 2));
-    if (typeof match.pwRating === 'number' && Number.isFinite(match.pwRating) && match.pwRating >= 0 && match.pwRating !== 1) rating.className = match.pwRating < 1 ? 'metric-below' : 'metric-above';
-    const level = node('td', '', 'match-level'); level.append(matchLevel(match));
-    const highlights = node('td', ''); highlights.append(matchHighlights(match));
-    tr.append(date, type, outcomeCell, score, kda, node('td', matchNumber(match.adpr)), node('td', matchNumber(match.rws, 2)), rating,
-      node('td', matchNumber(match.we, 1), 'match-we'), level, highlights); body.append(tr);
+    const kda = node('td', ''), adr = node('td', ''), rws = node('td', ''), rating = node('td', '');
+    const we = node('td', '', 'match-we'), level = node('td', '', 'match-level'), highlights = node('td', '');
+    level.append(matchLevel(match));
+    function update(patch) {
+      const number = (v, digits) => v == null && patch.detailState === 'pending' ? '…' : matchNumber(v, digits);
+      kda.textContent = [patch.kill, patch.death, patch.assist].map(v => number(v, 0)).join('/');
+      adr.textContent = number(patch.adpr, 0); rws.textContent = number(patch.rws, 2);
+      we.textContent = number(patch.we, 1); rating.textContent = number(patch.pwRating, 2);
+      rating.className = typeof patch.pwRating === 'number' && Number.isFinite(patch.pwRating) && patch.pwRating >= 0 && patch.pwRating !== 1
+        ? (patch.pwRating < 1 ? 'metric-below' : 'metric-above') : '';
+      highlights.replaceChildren(matchHighlights(patch));
+    }
+    update(match); updates.push(update);
+    tr.append(date, type, outcomeCell, score, kda, adr, rws, rating, we, level, highlights); body.append(tr);
   }
   table.append(body); wrap.append(table); return wrap;
 }
-function render(name, data) {
-  const article = $('results').querySelector('[data-index="' + rows.get(name).index + '"]');
-  article.replaceChildren();
+function render(name, data, version) {
+  const {article, views} = rows.get(name);
+  article.replaceChildren(); views.clear();
   article.setAttribute('aria-busy', 'false');
   if (data.error) { article.append(node('h3', name), node('p', data.error, 'error')); return; }
-  if (data.players) {
-    article.append(node('p', data.message));
-    data.players.forEach((player, index) => {
-      const section = node('section', '');
-      section.append(node('p', `同名账号 ${index + 1}`, 'hint'));
-      appendPlayerStats(section, {name, ...player});
-      article.append(section);
-    });
-    return;
-  }
   if (data.needsChoice) {
-    article.append(node('h3', name));
-    article.append(node('p', data.message));
+    article.append(node('h3', name), node('p', data.message));
     for (const candidate of data.candidates) {
       const button = node('button', candidate.pvpNickName, 'candidate');
       button.addEventListener('click', async () => {
+        if (version !== generation) return;
         const excluded = excludedNames();
         if (excluded.has(name) || excluded.has(candidate.pvpNickName)) {
-          message('progress', `已跳过「${candidate.pvpNickName}」：该玩家在过滤名单中。`);
-          return;
+          message('progress', `已跳过「${candidate.pvpNickName}」：该玩家在过滤名单中。`); return;
         }
         article.querySelectorAll('button').forEach(b => b.disabled = true);
-        try {
-          const result = await api('query', {name: candidate.pvpNickName, steamId: candidate.steamId, matches: true});
-          rows.get(name).data = result; render(name, result);
-        } catch (e) { article.append(node('p', e.message, 'error')); article.querySelectorAll('button').forEach(b => b.disabled = false); }
+        await watch([name], [candidate.pvpNickName], version, candidate.steamId);
       });
       article.append(button);
     }
     return;
   }
-  appendPlayerStats(article, data);
+  if (data.players) article.append(node('p', data.message));
+  (data.players || [data]).forEach((player, index) => {
+    const section = node('section', '');
+    if (data.players) section.append(node('p', `同名账号 ${index + 1}`, 'hint'));
+    article.append(section);
+    player.officialRank = latestOfficialRank(player.recentMatches);
+    const card = appendPlayerStats(section, player);
+    if (card) views.set(player.steamId, {data:player, card});
+  });
 }
+
+function stopPending(names, label) {
+  for (const name of names) {
+    const row = rows.get(name);
+    if (!row) continue;
+    if (!row.received) {
+      row.article.replaceChildren(node('h3', name), node('p', label, 'data-notice'));
+      row.article.setAttribute('aria-busy','false');
+    }
+    for (const {data, card} of row.views.values()) {
+      if (data.historyRankState === 'pending') card.history({historyRankState:'unavailable'});
+      (data.recentMatches || []).forEach((m,i) => {
+        if (m.detailState === 'pending') { m.detailState = 'unavailable'; card.detail(i,m); }
+      });
+    }
+  }
+}
+
+function cancel() {
+  generation++;
+  for (const session of sessions) {
+    session.controller.abort();
+    if (session.batch) api('batch/cancel', {batch:session.batch}).catch(() => {});
+  }
+  sessions.clear();
+  stopPending(rows.keys(), '查询已取消');
+  $('cancel').hidden = true; $('exclude-players').disabled = false;
+}
+
+async function watch(keys, names, version, steamId = '', started = performance.now()) {
+  const session = {controller:new AbortController()};
+  sessions.add(session); $('cancel').hidden = false;
+  const current = () => version === generation;
+  // Sample after the DOM update. The next frame is the browser's opportunity to paint it.
+  function timing(event) {
+    requestAnimationFrame(() => {
+      if (current()) api('batch/timing', {event, ms:Math.round(performance.now()-started), players:names.length}).catch(() => {});
+    });
+  }
+  let cursor = 0, resolved = 0, visible = false;
+  try {
+    const response = await api('batch/start', {names, steamId});
+    session.batch = response.batch;
+    if (!current()) { await api('batch/cancel', {batch:session.batch}); return; }
+    while (current()) {
+      const page = await api('batch/poll', {batch:session.batch, cursor}, session.controller.signal);
+      if (!current()) return;
+      for (const event of page.events) {
+        const name = keys[event.index], row = rows.get(name);
+        if (event.kind === 'base') {
+          render(name, event.data, version);
+          row.received = true; resolved++;
+          if (!visible && row.views.size) { visible = true; timing('first_player'); }
+          if (resolved === names.length) timing('all_basic');
+        } else {
+          const view = row.views.get(event.steamId);
+          if (event.kind === 'detail' && view) {
+            view.data.recentMatches[event.position] = event.data;
+            view.card.detail(event.position, event.data);
+          }
+          if (event.kind === 'history' && view) view.card.history(event.data);
+        }
+      }
+      cursor = page.cursor;
+      if (page.done) { timing('complete'); break; }
+      message('progress', `已返回 ${resolved} / ${names.length} 个昵称的基础结果，详情和历史分正在补充。`);
+    }
+    if (current()) message('progress', '查询完成。');
+  } catch (e) {
+    if (current()) {
+      stopPending(keys, '查询中断'); message('progress', e.message, true);
+      for (const name of keys) rows.get(name)?.article.querySelectorAll('button').forEach(b => b.disabled = false);
+    }
+  } finally {
+    if (session.batch && current()) api('batch/cancel', {batch:session.batch}).catch(() => {});
+    sessions.delete(session);
+    if (current()) { $('cancel').hidden = !sessions.size; $('exclude-players').disabled = sessions.size > 0; }
+  }
+}
+
+$('cancel').addEventListener('click', () => { cancel(); message('progress', '查询已取消。'); });
 $('mode').addEventListener('change', () => $('players').placeholder = $('mode').value === 'status' ? '粘贴游戏控制台 status 的完整输出' : '输入玩家昵称，每行一个');
 $('query').addEventListener('click', async () => {
-  if (busy) return; busy = true; $('query').disabled = true;
-  const excluded = excludedNames();
-  $('exclude-players').disabled = true;
+  cancel();
+  const version = generation, started = performance.now(), excluded = excludedNames();
+  $('exclude-players').disabled = true; $('cancel').hidden = false;
+  message('progress','正在查询…');
   try {
-    const {names: parsedNames} = await api('parse', {mode: $('mode').value, text: $('players').value});
-    const names = parsedNames.filter(name => !excluded.has(name));
-    const skipped = parsedNames.length - names.length;
+    const {names: parsed} = await api('parse', {mode:$('mode').value, text:$('players').value});
+    if (version !== generation) return;
+    const names = parsed.filter(n => !excluded.has(n)), skipped = parsed.length - names.length;
     rows.clear(); $('results').replaceChildren();
     $('count').textContent = `查询 ${names.length} 个昵称 · 已跳过 ${skipped} 个`;
-    if (!names.length) {
-      message('progress', `输入的 ${skipped} 个昵称均在过滤名单中，本次未查询任何玩家。`);
-      return;
-    }
-    for (const [index, name] of names.entries()) {
-      rows.set(name, {index, data: {name}});
-      const article = node('article', '', 'player'); article.dataset.index = index;
+    for (const name of names) {
+      const article = node('article', '', 'player');
       article.setAttribute('aria-busy', 'true');
       const waiting = node('div', '', 'player-card loading-card');
       waiting.append(node('h3', name), node('p', '等待查询近期比赛…'));
       const skeleton = node('div', '', 'loading-bars'); skeleton.setAttribute('aria-hidden', 'true');
-      skeleton.append(node('span', ''), node('span', ''), node('span', '')); waiting.append(skeleton);
+      skeleton.append(node('span', ''),node('span', ''),node('span', '')); waiting.append(skeleton);
       article.append(waiting); $('results').append(article);
+      rows.set(name, {article, views:new Map(), received:false});
     }
-    for (const [index, name] of names.entries()) {
-      message('progress', `正在查询 ${index + 1} / ${names.length}：${name}（包含历史赛季，首次查询稍慢）`);
-      let result;
-      try { result = await resolveDuplicates(name, await api('query', {name, matches: true})); }
-      catch (e) { result = {name, error: e.message}; }
-      rows.get(name).data = result; render(name, result);
-      if (index < names.length - 1) await new Promise(resolve => setTimeout(resolve, 600));
-    }
-    message('progress', `本批查询结束，已查询 ${names.length} 个昵称，跳过 ${skipped} 个。请查看结果与需要确认的玩家。`);
-  } catch (e) { message('progress', e.message, true); }
-  finally { busy = false; $('query').disabled = false; $('exclude-players').disabled = false; updateFilterStatus(); }
+    if (names.length) await watch(names, names, version, '', started);
+    else message('progress', `输入的 ${skipped} 个昵称均在过滤名单中，本次未查询任何玩家。`);
+  } catch (e) { if (version === generation) message('progress', e.message, true); }
+  finally {
+    if (version === generation && !sessions.size) { $('exclude-players').disabled = false; $('cancel').hidden = true; }
+  }
 });
 function loadScript(src) { return new Promise((resolve, reject) => { const script = document.createElement('script'); script.src = src; script.onload = resolve; script.onerror = () => { script.remove(); reject(new Error('官方验证组件加载失败，请稍后重试')); }; document.head.append(script); }); }
 $('send-code').addEventListener('click', async () => {
