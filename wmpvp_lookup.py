@@ -26,7 +26,7 @@ import os
 import re
 import sys
 import time
-import urllib.request
+from upstream import runtime
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -43,23 +43,13 @@ FORBID_TYPE = {
 }
 
 
-def http_json(url, payload=None, headers=None, method=None, retries=3):
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    h = {"Accept": "application/json"}
-    if payload is not None:
-        h["Content-Type"] = "application/json"
-    if headers:
-        h.update(headers)
-    last_err = None
-    for i in range(retries):
-        try:
-            req = urllib.request.Request(url, data=data, headers=h, method=method)
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except Exception as e:  # 瞬时代理/网络抖动, 指数退避重试
-            last_err = e
-            time.sleep(1.5 * (i + 1))
-    raise last_err
+async def _request(platform, api, url, payload, headers, method, retries):
+    return await platform.request(api, url, payload, headers, method=method, attempts=retries)
+
+
+def http_json(url, payload=None, headers=None, method=None, retries=2):
+    api = 'search' if url == SEARCH_URL else 'ban' if url.startswith(FORBID_URL) else 'recent'
+    return runtime.run(_request, api, url, payload, headers, method, retries)
 
 
 def search_user(keyword):
@@ -87,20 +77,9 @@ def ban_check(steam_id64):
 
 def match_list(to_steam_id, my_steam_id, token, page=1, page_size=20):
     """近期对局。注意: mySteamId 必须与 token 一一对应"""
-    headers = {"appversion": APPVERSION, "token": token}
-    payload = {
-        "csgoSeasonId": "recent",
-        "dataSource": 3,
-        "mySteamId": int(my_steam_id),
-        "page": page,
-        "pageSize": page_size,
-        "pvpType": -1,
-        "toSteamId": int(to_steam_id),
-    }
-    resp = http_json(MATCH_URL, payload=payload, headers=headers)
-    if resp.get("statusCode") == 0:
-        return (resp.get("data") or {}).get("matchList") or []
-    raise RuntimeError(f"match/list 失败: statusCode={resp.get('statusCode')} msg={resp.get('errorMessage')}")
+    async def read(platform):
+        return await platform.matches(MATCH_URL, APPVERSION, to_steam_id, my_steam_id, token, page, page_size)
+    return runtime.run(read)
 
 
 def summarize(matches, n=10):
@@ -262,4 +241,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        runtime.close()

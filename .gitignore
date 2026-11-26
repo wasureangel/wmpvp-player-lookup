@@ -14,3 +14,6 @@ wmpvp_config.json
 *.pem
 *.key
 .DS_Store
+
+.venv/
+.lookup-cache/
