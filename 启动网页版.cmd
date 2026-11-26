@@ -1,19 +1,32 @@
 @echo off
+setlocal
 cd /d "%~dp0"
-if exist "%~dp0runtime\pythonw.exe" (
-    start "" "%~dp0runtime\pythonw.exe" -X utf8 "%~dp0web_app.py" --open
-    exit /b
+if exist ".venv\Scripts\pythonw.exe" goto checkenv
+if exist "runtime\python.exe" (
+    "runtime\python.exe" -c "import httpx" >nul 2>&1
+    if not errorlevel 1 (
+        start "" "runtime\pythonw.exe" -X utf8 "web_app.py" --open
+        exit /b
+    )
 )
-where pyw >nul 2>&1
+py -3 -c "import sys; assert sys.version_info >= (3,10)" >nul 2>&1
 if not errorlevel 1 (
-    start "" pyw -3 -X utf8 "%~dp0web_app.py" --open
-    exit /b
+    py -3 -m venv .venv
+) else (
+    python -c "import sys; assert sys.version_info >= (3,10)" >nul 2>&1
+    if errorlevel 1 goto failed
+    python -m venv .venv
 )
-where pythonw >nul 2>&1
-if not errorlevel 1 (
-    start "" pythonw -X utf8 "%~dp0web_app.py" --open
-    exit /b
+if errorlevel 1 goto failed
+:checkenv
+".venv\Scripts\python.exe" -c "import httpx" >nul 2>&1
+if errorlevel 1 (
+    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    if errorlevel 1 goto failed
 )
-echo Python 3.10 or newer is required. Install Python, then run this file again.
-echo You can also run: python web_app.py --open
+start "" ".venv\Scripts\pythonw.exe" -X utf8 "web_app.py" --open
+exit /b
+:failed
+echo Setup failed. Install Python 3.10 or newer and check access to PyPI.
 pause
+exit /b 1

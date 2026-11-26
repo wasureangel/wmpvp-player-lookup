@@ -4,15 +4,21 @@
 
 ## 启动
 
-需要 **Python 3.10 或更新版本**，只使用标准库，无需安装 Python 依赖。Windows 安装 Python 时启用命令行入口，随后双击 `启动网页版.cmd`；启动器也支持项目内已有的 `runtime/pythonw.exe`。
+需要 Python 3.10 或更新版本。Windows 双击 `启动网页版.cmd`，首次启动会创建项目虚拟环境并安装 HTTP 客户端 httpx。已有内置运行时且已装好 httpx 时也能直接启动。
 
-也可以在项目目录运行：
+在 Linux 服务器上更新已有 Git 安装，先进入项目目录，确认当前分支和本机改动，再运行以下命令。PR 合并前可用它的分支进行试用，合并后使用 `main`。
 
 ```sh
-python web_app.py --open
+git status --short --branch
+git switch main
+git pull --ff-only origin main
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-浏览器会打开本机网页。关闭浏览器不会停止后台服务；电脑或服务重启后，需要重新启动、重新登录。GitHub 源码不包含内置 Python 运行时，首次下载请先安装 Python。
+将现有服务的 Python 启动路径指向项目的 `.venv/bin/python`，入口仍是 `web_app.py`，然后用原来的服务管理器重启并重新登录。手动运行可用 `.venv/bin/python web_app.py`。在桌面环境可增加 `--open` 自动打开浏览器。已有虚拟环境的安装可以继续使用原环境。
+
+默认访问 `http://127.0.0.1:8765/`。关闭浏览器不会停止后台服务；电脑或服务重启后，需要重新启动、重新登录。GitHub 源码不包含内置 Python 运行时，首次下载请先安装 Python。
 
 ## 查询功能
 
@@ -26,6 +32,31 @@ python web_app.py --open
 - 官匹分只取最近十场比赛列表里最新的有效 `pvpNormalRank`，全部为空不显示；不会用详情里的默认零覆盖空值。
 - 保留黄色方形 MVP，以及“准、狙、突、残、闪、助”高光图标，不显示 SVP。
 - 页面不展示封禁记录、64 位 ID、平台昵称或分数变化，不提供报告下载；网页版不请求封禁记录。
+
+## 查询过程与性能
+
+页面先按输入顺序留出卡片位置。后台并发搜索昵称、取近期列表，哪个玩家先返回就先填哪张卡。同名账号只先查列表，筛选完成后才为保留的账号补详情和历史分。每场比赛的数值和高光独立更新。取消或开始新查询会取消旧批次，已完成的列表仍可阅读。
+
+一个进程共用一个 `httpx.AsyncClient`。环境变量 `WMPVP_CONCURRENCY` 控制所有上游请求合计的并发上限，默认 6，支持 1–64。排队时基础查询优先于详情，详情优先于历史。遇到 429 会按主机共享等待时间，遵守秒数或 HTTP 日期格式的 `Retry-After`。长时间限流直接提示稍后重试。短信和登录请求只发送一次。
+
+SQLite 默认位于 `.lookup-cache/stats.sqlite3`，可通过 `WMPVP_CACHE_PATH` 指定位置。已结束比赛按 matchId、已结束赛季按 SteamID 和赛季编号缓存 180 天。当前赛季缓存 5 分钟，近期列表按登录会话隔离缓存 60 秒。并发读取同一缓存键时共享上游请求。失败不会写入缓存。
+
+同目录的 `performance.log` 记录接口类型、请求次数、耗时、缓存命中率、重试和失败类别，以及浏览器首张卡片、所有基础结果和完整查询的显示耗时。文件达到 1 MiB 后轮换，保留两份旧文件。日志不包含请求地址、昵称、手机号、请求体或 token。
+
+### 十人浏览器测速
+
+在已登录的本机服务使用桌面 Chrome，从点击查询算起，按动画帧观察实际战绩表。每组均显示了 10 名玩家、100 条记录。单位为秒。
+
+| 场景 | 首张战绩表 | 全部基础战绩 | 完整查询 |
+|---|---:|---:|---:|
+| 完美平台，登录后使用现有十人样本 | 0.296 | 0.677 | 12.147 |
+| 本地固定上游，旧版冷缓存 | 2.042 | 24.544 | 24.544 |
+| 本地固定上游，新版冷缓存 | 0.353 | 0.708 | 7.731 |
+| 本地固定上游，新版热缓存 | 0.170 | 0.301 | 0.301 |
+
+真实样本使用当时的本机缓存。十个昵称触发 10 次搜索、11 次近期列表请求（含同名筛选）、89 次详情请求和 225 次赛季请求，均成功返回。固定上游每次响应延迟 120 ms，每人有 10 场比赛及 25 个赛季，每组有一场十人共享比赛。冷缓存采用新服务和新数据库，热缓存重复同一批玩家。真实平台数据为单次测量，网络和限流会影响下一批耗时。
+
+复测时安装桌面 Chrome 及开发工具 `npm install --no-save --package-lock=false playwright-core`。运行 `python tests/benchmark_server.py` 后，在另一终端执行 `node scripts/benchmark.cjs http://127.0.0.1:8870`。重复执行可测热缓存。使用已登录服务和每行一个昵称的 UTF-8 文本可测真实接口，例如 `node scripts/benchmark.cjs http://127.0.0.1:8765 names.txt`。旧版对照可用 `--root 旧版源码目录` 启动同一组固定上游。
 
 ## 高光来源与限制
 
@@ -56,6 +87,7 @@ python web_app.py --open
 npm run check
 npm test
 python tests/local_web.py
+python tests/query_performance.py
 ```
 
 GitHub Actions 运行以上离线代码检查，不发送短信，不登录真实账号，也不自动部署。实际页面、登录及战绩效果由使用者验收。
@@ -65,7 +97,9 @@ GitHub Actions 运行以上离线代码检查，不发送短信，不登录真�
 ```text
 web.html / web.js / web.css  本机网页
 web_app.py                  只监听本机的网页服务
-wmpvp_lookup.py             原始命令行工具与平台请求
+wmpvp_lookup.py             命令行入口与输入解析
+upstream.py                 HTTP 连接池、全局调度、缓存、请求去重
+player_query.py / query_batch.py   战绩分阶段查询与取消
 rank-assets/                段位图标
 启动网页版.cmd              Windows 启动入口
 网页版说明.txt              详细使用说明
