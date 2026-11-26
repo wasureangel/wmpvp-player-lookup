@@ -17,29 +17,42 @@ const record = {startTime:'2026-11-18 23:26:00',mode:'完美官匹Pro',team:2,wi
 const active = {pvpScore:2450,historyPeakScore:1887,historyRankState:'available',recentMatches:Array.from({length:10},(_,i)=>({...record,startTime:`2026-11-${String(18-i).padStart(2,'0')} 23:26:00`})),matchMessage:''};
 const empty = {pvpScore:0,recentMatches:[],matchMessage:'近期无对局记录'};
 const failed = {error:'网络失败'};
-async function scenario(fixtures, expected, fuzzy = false) {
-  const elements = new Map();
-  const get = id => { assert.notEqual(id, 'matches', 'removed checkbox must not be accessed'); if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
-  const calls = [];
-  const candidates = fixtures.map((_, index) => ({pvpNickName:fuzzy ? '相似名字' : '同名测试', steamId:String(76561198000000000n + BigInt(index))}));
+// Exercise the production event stream contract. Backend tests cover which upstream requests produce these events.
+function harness(backend) {
+  const elements = new Map(), calls = [];
+  const get = id => {
+    assert.notEqual(id, 'matches');
+    if (!elements.has(id)) elements.set(id,new Element());
+    return elements.get(id);
+  };
   const sandbox = {
-    document:{getElementById:get, querySelector:() => ({content:'test'}), createElement:() => new Element()},
-    setInterval() {}, setTimeout:fn => {fn();},
+    document:{getElementById:get, querySelector:() => ({content:'test'}), createElement:tag => {
+      const el = new Element(); el.tagName = tag; return el;
+    }},
+    performance, AbortController, requestAnimationFrame:fn=>fn(), setInterval() {},
     fetch:async (url, options) => {
-      const body = JSON.parse(options.body); let result, ok = true;
-      if (url.endsWith('/query')) assert.equal(body.matches, true, 'every player query must request recent matches');
-      if (url.endsWith('/auth/status')) result = {loggedIn:true,steamId:'76561198000000000',matchesVerified:true};
-      else if (url.endsWith('/parse')) result = {names:['同名测试']};
-      else if (url.endsWith('/match-ranks')) {
-        const fixture = fixtures[candidates.findIndex(c => c.steamId === body.steamId)];
-        ok = !fixture.rankError; result = ok ? {records: fixture.rankRecords || []} : {error:'网络失败'};
-      }
-      else if (!body.steamId) result = {needsChoice:true,candidates,message:'请选择'};
-      else { calls.push(body); result = {...fixtures[candidates.findIndex(c => c.steamId === body.steamId)],steamId:body.steamId}; ok = !result.error; }
-      return {ok,json:async () => result};
+      const body = JSON.parse(options.body), path=url.slice(5);
+      calls.push({path,body});
+      let value = {};
+      if (path==='auth/status') value={loggedIn:true};
+      else if (!['batch/cancel','batch/timing'].includes(path)) value=await backend(path,body,get);
+      return {ok:!value.error,json:async()=>value};
     }
   };
-  vm.runInNewContext(source.replace(/\}\)\(\);\s*$/, 'globalThis.rankForScoreTest = rankForScore;globalThis.tableTest = matchTable;globalThis.outcomeTest = matchOutcome;globalThis.highlightTest = matchHighlights;globalThis.officialTierTest = officialRankTier;globalThis.latestOfficialTest = latestOfficialRank;})();'), sandbox);
+  vm.runInNewContext(source.replace(/\}\)\(\);\s*$/, 'Object.assign(globalThis,{rankForScoreTest:rankForScore,tableTest:matchTable,outcomeTest:matchOutcome,highlightTest:matchHighlights,officialTierTest:officialRankTier,latestOfficialTest:latestOfficialRank});})();'),sandbox);
+  return {get,calls,sandbox,elements};
+}
+async function scenario(fixtures, expected, fuzzy = false) {
+  const names=['同名测试'];
+  const players=fixtures.map((f,i)=>({...f,steamId:String(76561198000000000n+BigInt(i))}));
+  const selected=players.some(p=>p.recentMatches?.length) ? players.filter(p=>p.recentMatches?.length!==0) : players;
+  const {get,elements,sandbox,calls}=harness((path,body)=>{
+    if(path==='parse') return {names};
+    if(path==='batch/start') return {batch:'one'};
+    const data=fuzzy ? {needsChoice:true,candidates:[{pvpNickName:'相似名字',steamId:'1'}],message:'请选择'} :
+      {players:selected.map(p=>p.error?{...p,error:'近期对局查询失败'}:p),message:`显示 ${selected.length} 个`};
+    return {events:[{kind:'base',index:0,data}],cursor:1,done:true};
+  });
   for (const [score,tier] of [[0,'gray'],[4999,'gray'],[5000,'light-blue'],[9999,'light-blue'],[10000,'blue'],[14999,'blue'],[15000,'purple'],[19999,'purple'],[20000,'magenta'],[24999,'magenta'],[25000,'red'],[29999,'red'],[30000,'gold'],[100000,'gold'],[null,null],[-1,null],[true,null],[3.5,null],['20000',null]]) assert.equal(sandbox.officialTierTest(score),tier);
   assert.equal(sandbox.latestOfficialTest([{pvpNormalRank:null},{pvpNormalRank:0},{pvpNormalRank:20000}]).score,0);
   assert.equal(sandbox.latestOfficialTest(Array(10).fill({pvpNormalRank:null}).concat([{pvpNormalRank:20000}])),null);
@@ -62,10 +75,8 @@ async function scenario(fixtures, expected, fuzzy = false) {
   await get('query').handlers.click();
   const display = text(get('results'));
   if (fuzzy) {
-    assert.equal(calls.length,0); assert.match(display,/请选择/); return;
+    assert.equal(calls.filter(c=>c.path==='batch/start').length,1); assert.match(display,/请选择/); return;
   }
-  assert.equal(calls.length,fixtures.length);
-  assert.ok(calls.every(call => call.matches === true), 'same-name checks must always request recent matches');
   assert.match(display, new RegExp(`显示 ${expected} 个`));
   const flatten = element => [element, ...element.children.flatMap(flatten)];
   const peakBadges = flatten(get('results')).filter(element => element.className === 'rank-icon history-rank');
@@ -86,50 +97,34 @@ async function scenario(fixtures, expected, fuzzy = false) {
   get('exclude-players').value = '其他玩家\n 同名测试 \n同名测试';
   get('exclude-players').handlers.input();
   assert.notEqual(get('results').children[0].hidden,true,'editing filter must preserve existing results');
-  const previousCalls = calls.length;
+  const previousCalls = calls.filter(c=>c.path==='batch/start').length;
   await get('query').handlers.click();
-  assert.equal(calls.length,previousCalls,'filtered players must not be queried again');
-  assert.equal(get('results').children.length,0,'all filtered must leave no loading cards');
+  assert.equal(calls.filter(c=>c.path==='batch/start').length,previousCalls);
+  assert.equal(get('results').children.length,0);
   assert.match(get('progress').textContent,/未查询任何玩家/);
   get('exclude-players').value = '';
   get('exclude-players').handlers.input();
   await get('query').handlers.click();
-  assert.equal(calls.length,previousCalls * 2,'clearing filter must query players again');
+  assert.equal(calls.filter(c=>c.path==="batch/start").length,previousCalls * 2,'clearing filter must query players again');
 }
 async function filteringScenario(mode) {
-  const elements = new Map(), calls = [];
-  const get = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
   const names = ['ARRYJW','大禄鸠叔叔','ARRYJW2'];
-  let parseError = false;
-  const sandbox = {
-    document:{getElementById:get,querySelector:() => ({content:'test'}),createElement:tag => { const el = new Element(); el.tagName = tag; return el; }},
-    setInterval() {},setTimeout:fn => fn(),
-    fetch:async (url, options) => {
-      const body = JSON.parse(options.body); calls.push({url,body});
-      let result, ok = true;
-      if (url.endsWith('/auth/status')) result = {loggedIn:true,matchesVerified:true};
-      else if (url.endsWith('/parse')) {
-        assert.equal(get('exclude-players').disabled,true,'filter is fixed for the running batch');
-        assert.equal(body.mode,mode);
-        ok = !parseError;
-        result = ok ? {names} : {error:'输入格式错误'};
-      }
-      else if (url.endsWith('/query')) {
-        assert.equal(body.matches,true);
-        result = {name:body.name,steamId:body.name,...active};
-      }
-      else if (url.endsWith('/match-ranks')) result = {records:active.rankRecords};
-      else assert.fail(`unexpected API ${url}`);
-      return {ok,json:async () => result};
+  let parseError=false, batch=[];
+  const {get,calls}=harness((path,body,get)=>{
+    if(path==='parse'){
+      assert.equal(get('exclude-players').disabled,true);
+      assert.equal(body.mode,mode);
+      return parseError ? {error:'输入格式错误'} : {names};
     }
-  };
-  vm.runInNewContext(source,sandbox);
+    if(path==='batch/start') {batch=body.names;return {batch:'batch'};}
+    return {events:batch.map((n,index)=>({kind:'base',index,data:{name:n,steamId:n,...active}})),cursor:batch.length,done:true};
+  });
   get('mode').value = mode;
   get('players').value = mode === 'status' ? '# userid name uniqueid\n# 1 "ARRYJW" STEAM_1:0:1' : names.join('\n');
   get('exclude-players').value = ' ARRYJW \r\n\n大禄鸠叔叔\nARRYJW\n不在查询中';
   get('exclude-players').handlers.input();
-  const queryNames = () => calls.filter(call => call.url.endsWith('/query')).map(call => call.body.name);
-  const rankNames = () => calls.filter(call => call.url.endsWith('/match-ranks')).map(call => call.body.steamId);
+  const queryNames = () => calls.filter(c=>c.path==='batch/start').flatMap(c=>c.body.names);
+  const rankNames = () => calls.filter(c=>c.path==='match-ranks');
   await get('query').handlers.click();
   assert.deepEqual(queryNames(),['ARRYJW2'],'exact matching skips excluded queries and preserves similar names');
   assert.deepEqual(rankNames(),[],'reuse match records; no separate official-score request');
@@ -146,7 +141,7 @@ async function filteringScenario(mode) {
   assert.deepEqual(rankNames(),[]);
   assert.equal(get('results').children.length,0);
   assert.match(get('count').textContent,/查询 0 个昵称 · 已跳过 3 个/);
-  assert.equal(get('query').disabled,false);
+  assert.notEqual(get('query').disabled,true);
   assert.equal(get('exclude-players').disabled,false);
   get('exclude-players').value = '';
   await get('query').handlers.click();
@@ -154,28 +149,19 @@ async function filteringScenario(mode) {
   assert.deepEqual(rankNames(),[]);
   parseError = true;
   await get('query').handlers.click();
-  assert.equal(get('query').disabled,false,'parse failures must unlock query button');
+  assert.notEqual(get('query').disabled,true,'parse failures must unlock query button');
   assert.equal(get('exclude-players').disabled,false,'parse failures must unlock filter input');
   assert.match(get('progress').textContent,/输入格式错误/);
 }
 async function candidateFilteringScenario() {
-  const elements = new Map(), queries = [];
-  const get = id => { if (!elements.has(id)) elements.set(id,new Element()); return elements.get(id); };
-  const sandbox = {
-    document:{getElementById:get,querySelector:() => ({content:'test'}),createElement:tag => { const el = new Element(); el.tagName = tag; return el; }},
-    setInterval() {},setTimeout:fn => fn(),
-    fetch:async (url,options) => {
-      const body = JSON.parse(options.body); let result;
-      if (url.endsWith('/auth/status')) result = {loggedIn:false};
-      else if (url.endsWith('/parse')) result = {names:['输入昵称']};
-      else if (url.endsWith('/query')) {
-        queries.push(body);
-        result = body.steamId ? {name:body.name,...empty} : {needsChoice:true,message:'请选择',candidates:[{pvpNickName:'候选玩家',steamId:'1'}]};
-      } else assert.fail(`unexpected API ${url}`);
-      return {ok:true,json:async () => result};
-    }
-  };
-  vm.runInNewContext(source,sandbox);
+  const queries=[];
+  const {get}=harness((path,body)=>{
+    if(path==='parse') return {names:['输入昵称']};
+    if(path==='batch/start'){queries.push(body);return {batch:'choice'};}
+    const data=queries.at(-1).steamId? {steamId:'1',...empty} :
+      {needsChoice:true,message:'请选择',candidates:[{pvpNickName:'候选玩家',steamId:'1'}]};
+    return {events:[{kind:'base',index:0,data}],cursor:1,done:true};
+  });
   await get('query').handlers.click();
   const button = get('results').children[0].querySelectorAll('button')[0];
   for (const excluded of ['候选玩家','输入昵称']) {
@@ -187,7 +173,36 @@ async function candidateFilteringScenario() {
   await button.handlers.click();
   assert.equal(queries.length,2,'removing candidate from filter allows querying');
 }
+async function progressiveAndCancellation() {
+  let pending, turn=0;
+  const {get,calls}=harness((path,body)=>{
+    if(path==='parse') return {names:['slow','fast']};
+    if(path==='batch/start') return {batch:String(++turn)};
+    if(body.batch==='2') return {events:[{kind:'base',index:0,data:{name:'new',steamId:'new',...empty}}],cursor:1,done:true};
+    if(body.cursor===0) return {events:[{kind:'base',index:1,data:{name:'fast',steamId:'f',historyRankState:'pending',
+      recentMatches:[{...record,honor:'',detailState:'pending'}]}}],cursor:1,done:false};
+    return new Promise(resolve => {pending=resolve;});
+  });
+  const before=get('query').handlers.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  const [slow,fast]=get('results').children;
+  assert.match(text(slow),/等待/);assert.match(text(fast),/加载中/);
+  assert.match(text(fast),/20\/4\/4/);
+  const finish=pending;
+  finish({events:[{kind:'history',index:1,steamId:'f',data:{historyRankState:'unavailable'}},
+    {kind:'detail',index:1,steamId:'f',position:0,data:{...record,detailState:'ready'}}],cursor:3,done:false});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(get('results').children[1],fast);
+  assert.match(text(fast),/历史分数查询暂时失败/);assert.match(text(fast),/准/);
+  get('cancel').handlers.click();
+  await get('query').handlers.click();
+  pending({events:[{kind:'base',index:0,data:{error:'stale'}}],cursor:4,done:true});
+  await before;
+  assert.doesNotMatch(text(get('results')),/stale/);
+  assert.ok(calls.some(c=>c.path==='batch/cancel' && c.body.batch==='1'));
+}
 (async () => {
+  await progressiveAndCancellation();
   await filteringScenario('names');
   await filteringScenario('status');
   await candidateFilteringScenario();

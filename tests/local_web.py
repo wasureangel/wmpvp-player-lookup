@@ -1,169 +1,172 @@
-import importlib.util
 import json
 from pathlib import Path
-from unittest.mock import patch
+import sys
 import unittest
+from unittest.mock import AsyncMock, patch
 
-root = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('web', root / 'web_app.py')
-web = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(web)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import httpx
+import player_query as q
+import web_app as web
+from upstream import Platform, PlatformError
 
-class WebTests(unittest.TestCase):
-    def tearDown(self):
+SID = '76561198000000000'
+OTHER = '76561198000000001'
+AUTH = {'steamId': SID, 'token': 'fixture-token'}
+
+
+class WebTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.p = Platform(':memory:', transport=httpx.MockTransport(self.respond))
+        self.responses = {}
+        self.calls = []
+
+    async def asyncTearDown(self):
         web.AUTH.clear()
-        web.HISTORY_CACHE.clear()
-        web.SEASONS_CACHE.update(expires=0, seasons=[])
+        await self.p.close()
 
-    def test_parse_and_limits(self):
-        self.assertEqual(web.dispatch('/api/parse', {'text':'a\na\nb'})['names'], ['a','b'])
+    def respond(self, request):
+        path = request.url.path.rsplit('/', 1)[-1]
+        self.calls.append((path, json.loads(request.content) if request.content else {}))
+        item = self.responses[path]
+        result = item(self.calls[-1][1]) if callable(item) else item
+        return httpx.Response(200, json=result)
+
+    async def dispatch(self, path, **data):
+        return await web.dispatch(self.p, '/api/' + path, data)
+
+    async def test_parse_and_limits(self):
+        self.assertEqual((await self.dispatch('parse', text='a\na\nb'))['names'], ['a','b'])
         with self.assertRaises(ValueError):
-            web.dispatch('/api/parse', {'text':'\n'.join(str(n) for n in range(21))})
+            await self.dispatch('parse', text='\n'.join(map(str,range(21))))
 
-    def test_rank_inspection_requires_login_and_preserves_raw_values(self):
+    async def test_rank_inspection_requires_login_and_preserves_raw_values(self):
         with self.assertRaises(ValueError):
-            web.dispatch('/api/match-ranks',{'steamId':'76561199148425546'})
-        web.AUTH.update(token='TEST_ONLY',steamId='76561198000000000')
-        matches=[{'rank':12345,'oldrank':12000,'deltaRank':345,'pvpScore':1800,'mode':'test','token':'DO_NOT_EXPOSE'},
-                 {'rank':0,'oldrank':0,'deltaRank':None},{'rank':0}]
-        with patch.object(web.lookup,'match_list',return_value=matches) as request:
-            result=web.dispatch('/api/match-ranks',{'steamId':'76561199148425546'})
-        request.assert_called_once_with('76561199148425546','76561198000000000','TEST_ONLY',page_size=10)
-        self.assertEqual(result['records'],[{'rank':12345,'oldrank':12000,'deltaRank':345,'pvpScore':1800,'mode':'test'},
-                         {'rank':0,'oldrank':0,'deltaRank':None},{'rank':0}])
+            await self.dispatch('match-ranks', steamId=OTHER)
+        web.AUTH.update(AUTH)
+        matches = [{'rank':12345,'oldrank':12000,'deltaRank':345,'pvpScore':1800,'mode':'test'},
+                   {'rank':0,'oldrank':0,'deltaRank':None},{'rank':0}]
+        self.responses['list'] = {'statusCode':0,'data':{'matchList':[dict(m,token='hidden') for m in matches]}}
+        self.assertEqual((await self.dispatch('match-ranks',steamId=OTHER))['records'], matches)
+        self.assertEqual(self.calls[0][1]['toSteamId'], int(OTHER))
+        self.assertEqual(self.calls[0][1]['pageSize'],10)
 
-    def test_ambiguous_never_autopicks(self):
-        with patch.object(web, 'remote', return_value={'code':1,'result':[{'steamId':'76561198000000000','pvpNickName':'other'}]}):
-            self.assertTrue(web.query({'name':'wanted'})['needsChoice'])
+    async def test_ambiguous_never_autopicks(self):
+        self.responses['user'] = {'code':1,'result':[{'steamId':SID,'pvpNickName':'other'}]}
+        self.assertTrue((await q.basic(self.p,'wanted',{}))['needsChoice'])
 
-    def test_login_hides_token_and_logout_clears(self):
-        response = {'result':{'loginResult':{'accountInfo':{'token':'TEST_ONLY_SECRET','steamId':'76561198000000000'}}}}
-        with patch.object(web, 'passport', return_value=response), patch.object(web, 'remote', return_value={}):
-            result = web.dispatch('/api/auth/login', {'mobile':'00000000000','code':'000000'})
+    async def test_login_hides_token_and_logout_clears(self):
+        response = {'result':{'loginResult':{'accountInfo':AUTH}}}
+        with patch.object(web, 'passport', new=AsyncMock(return_value=response)), patch.object(self.p,'request',return_value={}):
+            result = await self.dispatch('auth/login',mobile='00000000000', code='000000')
         self.assertTrue(result['loggedIn'])
-        self.assertNotIn('TEST_ONLY_SECRET', json.dumps(result))
+        self.assertNotIn(AUTH['token'], json.dumps(result))
         self.assertFalse(result['matchesVerified'])
-        self.assertFalse(web.dispatch('/api/auth/logout', {})['loggedIn'])
+        self.assertFalse((await self.dispatch('auth/logout'))['loggedIn'])
 
-    def test_verify_failure_not_accepted(self):
-        web.AUTH.update(token='TEST_ONLY_SECRET')
-        with patch.object(web.lookup, 'match_list', side_effect=RuntimeError()):
-            with self.assertRaises(ValueError):
-                web.dispatch('/api/auth/steamid', {'steamId':'76561198000000000'})
+    async def test_verify_failure_not_accepted(self):
+        web.AUTH.update(AUTH)
+        self.responses['list'] = {'statusCode':403}
+        with self.assertRaises(ValueError):
+            await self.dispatch('auth/steamid', steamId=SID)
         self.assertFalse(web.status()['matchesVerified'])
 
-    def test_score_matches_selected_id(self):
-        response = {'code':1, 'result':[
-            {'steamId':'76561198000000000','pvpNickName':'test','pvpScore':900},
-            {'steamId':'76561198000000001','pvpNickName':'test','pvpScore':2431}]}
-        with patch.object(web,'remote',side_effect=[response,{'data':{'list':[]}}]):
-            row = web.query({'name':'test','steamId':'76561198000000001'})
+    async def test_score_matches_selected_id(self):
+        self.responses['user'] = {'code':1,'result':[{'steamId':SID,'pvpNickName':'test','pvpScore':900},
+                                                     {'steamId':OTHER,'pvpNickName':'test','pvpScore':2431}]}
+        row = await q.basic(self.p,'test',{},sid=OTHER)
         self.assertEqual(row['pvpScore'],2431)
+        self.assertEqual(row['historyRankState'],'pending')
 
     def test_score_missing_not_unranked(self):
-        self.assertIsNone(web.score_value(None))
-        self.assertIsNone(web.score_value(True))
-        self.assertIsNone(web.score_value(float('nan')))
-        self.assertIsNone(web.score_value(-1))
-        self.assertEqual(web.score_value(0),0)
+        for value in [None,True,float('nan'),-1]:
+            self.assertIsNone(q.score_value(value))
+        self.assertEqual(q.score_value(0),0)
 
     def test_history_peak_uses_only_valid_history_scores(self):
-        self.assertEqual(web.history_peak([1528,1553,1887]),1887)
-        self.assertEqual(web.history_peak([0, None, True, -1, '2800', float('nan')]),0)
-        self.assertIsNone(web.history_peak([]))
-        self.assertIsNone(web.history_peak(None))
-        self.assertIsNone(web.history_peak({'score':3000}))
+        self.assertEqual(q.history_peak([1528,1553,1887]),1887)
+        self.assertEqual(q.history_peak([0,None,True,-1,'2800',float('nan')]),0)
+        for value in [[],None,{'score':3000}]:
+            self.assertIsNone(q.history_peak(value))
 
-    def test_detail_selects_id_and_keeps_list_precision(self):
-        detail = {'statusCode':0,'data':{'players':[
-            {'playerId':'other','adpr':900},
-            {'playerId':'target','adpr':73,'we':6.5,'pwRating':1.05,'rws':8.4,'headShotRatio':.5455}]}}
-        with patch.object(web,'remote',return_value=detail):
-            player = web.match_player({'matchId':'PVP@123','we':6.5461},'target')
-        self.assertEqual(player['adpr'],73)
-        self.assertEqual(player['we'],6.5461)
-        with patch.object(web,'remote',side_effect=RuntimeError()):
-            self.assertEqual(web.match_player({'matchId':'PVP@123','kill':5},'target')['kill'],5)
+    async def test_detail_selects_id_and_keeps_list_precision(self):
+        self.responses['match'] = {'statusCode':0,'data':{'players':[{'playerId':OTHER,'adpr':900},
+                                 {'playerId':SID,'adpr':73,'we':6.5,'pwRating':1.05,'rws':8.4}]}}
+        result = await q.match_player(self.p,{'matchId':'PVP@123','we':6.5461},SID)
+        self.assertEqual((result['adpr'],result['we']), (73,6.5461))
+        self.responses['match'] = {'statusCode':404}
+        result = await q.match_player(self.p,{'matchId':'PVP@456','kill':5},SID)
+        self.assertEqual((result['kill'],result['detailState']), (5,'unavailable'))
 
-    def test_authenticated_recent_path_requests_ten_and_enriches_only_ten(self):
-        matches = [dict(matchId=f'PVP@{i}',we=5,team=1,winTeam=1) for i in range(11)]
-        with patch.object(web.lookup,'match_list',return_value=matches) as listed, \
-             patch.object(web,'match_player',side_effect=lambda match,sid: match) as detail:
-            result = web.recent_matches('target',{'steamId':'self','token':'TEST_ONLY'})
-        listed.assert_called_once_with('target','self','TEST_ONLY',page_size=10)
-        self.assertEqual(detail.call_count,10)
-        self.assertEqual(len(result),10)
+    async def test_authenticated_recent_path_requests_ten_and_enriches_only_ten(self):
+        self.responses.update(user={'code':1,'result':[{'steamId':SID,'pvpNickName':'test'}]},
+            list={'statusCode':0,'data':{'matchList':[{'matchId':f'm{i}'} for i in range(11)]}},
+            match={'statusCode':0,'data':{'players':[{'playerId':SID,'adpr':80}]}},
+            csgoSeasons={'statusCode':0,'data':[{'season':'S1'}]},
+            pvpDetailStats={'statusCode':0,'data':{'seasonId':'S1','historyScores':[]}})
+        web.AUTH.update(AUTH)
+        row = await self.dispatch('query', name='test', matches=True)
+        self.assertEqual(len(row['recentMatches']),10)
+        self.assertEqual([k for k,_ in self.calls].count('match'),10)
+        self.assertEqual(next(p['pageSize'] for k,p in self.calls if k=='list'),10)
+        self.assertNotIn('stats',row)
+        self.assertNotIn('ban',row)
 
-    def test_history_does_not_fall_back_to_current_or_scorelist(self):
-        with patch.object(web,'remote',return_value={'statusCode':0,'data':{'seasonId':'S25','pvpScore':2500,'scoreList':[{'score':3000}]}}):
-            self.assertIsNone(web.season_history_peak('76561198000000000','S25'))
-        with patch.object(web,'remote',return_value={'statusCode':90003,'data':None}):
-            with self.assertRaises(ValueError):
-                web.season_history_peak('76561198000000000','S25')
+    async def test_history_does_not_fall_back_to_current_or_scorelist(self):
+        self.responses['pvpDetailStats'] = {'statusCode':0,'data':{'seasonId':'S25','pvpScore':2500,'scoreList':[{'score':3000}]}}
+        self.assertIsNone(await q.season_history_peak(self.p,SID,'S25'))
+        self.responses['pvpDetailStats'] = {'statusCode':90003}
+        with self.assertRaises(PlatformError):
+            await q.season_history_peak(self.p,OTHER,'S25')
 
-    def test_history_empty_recent_does_not_hide_old_season_peak(self):
-        def response(url, payload=None, headers=None):
-            if url.endswith('csgoSeasons'):
-                return {'statusCode':0,'data':[{'season':'S25'},{'season':'S23'},{'season':'S15'}]}
-            season = payload['csgoSeasonId']
-            return {'statusCode':0,'data':{'seasonId':season,'historyScores':{'S25':[], 'S23':[2687], 'S15':[2500,2852]}[season]}}
-        with patch.object(web,'remote',side_effect=response) as remote:
-            result = web.query_history('76561199148425546')
-            self.assertEqual(result['historyPeakScore'],2852)
-            self.assertEqual(result['historyRankState'],'available')
-            self.assertEqual(result['historySeasonsChecked'],3)
-            calls = remote.call_count
-            self.assertEqual(web.query_history('76561199148425546'),result)
-            self.assertEqual(remote.call_count,calls)
+    async def test_history_empty_recent_does_not_hide_old_season_peak(self):
+        self.responses['csgoSeasons'] = {'statusCode':0,'data':[{'season':s} for s in ('S25','S23','S15')]}
+        def stats(body):
+            s = body['csgoSeasonId']
+            return {'statusCode':0,'data':{'seasonId':s,'historyScores':{'S25':[],'S23':[2687],'S15':[2500,2852]}[s]}}
+        self.responses['pvpDetailStats'] = stats
+        result = await q.query_history(self.p,SID)
+        self.assertEqual((result['historyPeakScore'],result['historyRankState'],result['historySeasonsChecked']), (2852,'available',3))
+        self.assertEqual(await q.query_history(self.p,SID),result)
+        self.assertEqual(len(self.calls),4)
 
-    def test_partial_seasons_are_explicit_and_not_cached(self):
-        def peak(sid, season):
-            if season == 'S25': raise RuntimeError('offline')
-            return 2852
-        with patch.object(web,'history_seasons',return_value=['S25','S15']), patch.object(web,'season_history_peak',side_effect=peak):
-            result = web.query_history('target')
-        self.assertEqual(result['historyRankState'],'partial')
-        self.assertEqual(result['historyPeakScore'],2852)
-        self.assertNotIn('target',web.HISTORY_CACHE)
+    async def test_partial_seasons_are_explicit_and_failed_season_retried(self):
+        self.responses['csgoSeasons'] = {'statusCode':0,'data':[{'season':'S25'},{'season':'S15'}]}
+        self.responses['pvpDetailStats'] = lambda b: ({'statusCode':403} if b['csgoSeasonId']=='S25'
+              else {'statusCode':0,'data':{'seasonId':'S15','historyScores':[2852]}})
+        result = await q.query_history(self.p,SID)
+        self.assertEqual((result['historyRankState'],result['historyPeakScore']),('partial',2852))
+        await q.query_history(self.p,SID)
+        self.assertEqual(len(self.calls),4)
 
-    def test_missing_season_catalog_never_claims_full_history(self):
-        with patch.object(web,'history_seasons',side_effect=RuntimeError()), patch.object(web,'season_history_peak',return_value=1528):
-            result = web.query_history('target')
+    async def test_missing_season_catalog_never_claims_full_history(self):
+        with patch.object(q,'history_seasons',side_effect=PlatformError('network')), patch.object(q,'season_history_peak',return_value=1528):
+            result = await q.query_history(self.p,SID)
         self.assertEqual(result['historyRankState'],'partial')
         self.assertIsNone(result['historySeasonsTotal'])
-        with patch.object(web,'remote',return_value={'statusCode':0,'data':{'seasonId':'S25','historyScores':[9999]}}):
-            with self.assertRaises(ValueError): web.season_history_peak('target','S15')
-
-    def test_query_returns_individual_games_without_ban_or_summary_queries(self):
-        web.AUTH.update(token='TEST_ONLY',steamId='76561198000000000')
-        def remote(url, payload=None, headers=None):
-            self.assertEqual(url,web.lookup.SEARCH_URL)
-            return {'code':1,'result':[{'steamId':'76561198000000001','pvpNickName':'test','pvpScore':1800}]}
-        records=[{'kill':20,'death':0,'assist':4,'pwRating':1.85,'adpr':115}]
-        with patch.object(web,'remote',side_effect=remote), patch.object(web,'query_history',return_value={}), patch.object(web,'recent_matches',return_value=records) as recent:
-            result=web.query({'name':'test','matches':True})
-        self.assertEqual(result['recentMatches'],records)
-        self.assertNotIn('stats',result)
-        self.assertNotIn('ban',result)
-        recent.assert_called_once()
+        self.responses['pvpDetailStats'] = {'statusCode':0,'data':{'seasonId':'S25','historyScores':[9999]}}
+        with self.assertRaises(PlatformError):
+            await q.season_history_peak(self.p,SID,'S15')
 
     def test_detail_keeps_zero_and_fills_honors_for_correct_player(self):
-        detail={'statusCode':0,'data':{'players':[{'playerId':'other','honor':'1'},{'playerId':'target','honor':'5,2','assist':4,'adpr':70,'rws':8,'pwRating':1.2,'mvp':False}]}}
-        with patch.object(web,'remote',return_value=detail):
-            result=web.match_player({'matchId':'PVP@123','kill':0,'death':0,'pwRating':0},'target')
+        detail={'players':[{'playerId':'other','honor':'1'},{'playerId':SID,'honor':'5,2','assist':4,'adpr':70,'pwRating':1.2}]}
+        result=q.merge_detail({'kill':0,'death':0,'pwRating':0},SID,detail)
         self.assertEqual(result['honor'],'5,2')
         self.assertEqual(result['assist'],4)
         self.assertEqual(result['pwRating'],0)
-        self.assertNotIn('headShotRatio',result)
 
-    def test_records_whitelist_and_detail_failure_preserve_matches(self):
-        raw={'matchId':'PVP@1','kill':5,'honor':'5','token':'SECRET','headShotRatio':.5}
-        with patch.object(web.lookup,'match_list',return_value=[raw]), patch.object(web,'remote',side_effect=RuntimeError()):
-            records=web.recent_matches('target',{'steamId':'self','token':'TEST'})
-        self.assertEqual(len(records),1)
-        self.assertEqual(records[0]['kill'],5)
-        self.assertIsNone(records[0]['adpr'])
-        self.assertNotIn('token',records[0])
-        self.assertNotIn('headShotRatio',records[0])
+    async def test_records_whitelist_and_detail_failure_preserve_matches(self):
+        self.responses.update(user={'code':1,'result':[{'steamId':SID,'pvpNickName':'test'}]},
+               list={'statusCode':0,'data':{'matchList':[{'matchId':'PVP@1','kill':5,'honor':'5','token':'hidden','headShotRatio':.5}]}},
+               match={'statusCode':3})
+        row=await q.basic(self.p,'test',AUTH)
+        record=await q.match_player(self.p,row['recentMatches'][0],SID)
+        self.assertEqual(record['kill'],5)
+        self.assertIsNone(record['adpr'])
+        self.assertNotIn('token',record)
+        self.assertNotIn('headShotRatio',record)
+        self.assertEqual([k for k,_ in self.calls],['user','list','match'])
 
-unittest.main()
+
+if __name__ == '__main__':
+    unittest.main()

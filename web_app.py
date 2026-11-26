@@ -1,6 +1,8 @@
 """Loopback-only web UI for the supplied lookup tool."""
 import json
-import math
+import asyncio
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
@@ -11,7 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parent
@@ -21,30 +23,27 @@ if sys.stderr is None:
     sys.stderr = sys.stdout
 sys.path.insert(0, str(ROOT))
 import wmpvp_lookup as lookup
+import query_batch
+from player_query import basic, match_player, query_history
+from upstream import LOG, PlatformError, runtime
 
-PORT = 8765
+PORT = int(os.environ.get('WMPVP_PORT', '8765'))
 ORIGIN = f'http://127.0.0.1:{PORT}'
 CSRF = secrets.token_urlsafe(32)
 AUTH = {}
 LOCK = threading.RLock()
 LAST_SMS = 0
 PASSPORT = 'https://passport.pwesports.cn'
-HISTORY_CACHE = {}
-SEASONS_CACHE = {'expires': 0, 'seasons': []}
-
-
-def remote(url, payload=None, headers=None):
-    return lookup.http_json(url, payload, headers, retries=1)
-
-
-def passport(path, payload=None):
-    result = remote(PASSPORT + path, payload, {'platform': 'APP', 'appversion': '3.1.0'})
-    if result.get('code') != 0:
-        description = str(result.get('description') or '官方登录服务未能完成请求')[:200]
-        if description == 'Invalid mobile phone':
-            description = '手机号无效，请核对后重试'
-        raise ValueError(description)
-    return result
+async def passport(platform, path, payload=None):
+    def decode(result):
+        if result.get('code') != 0:
+            description = str(result.get('description') or '官方登录服务未能完成请求')[:200]
+            if description == 'Invalid mobile phone':
+                description = '手机号无效，请核对后重试'
+            raise PlatformError('business', description)
+        return result
+    return await platform.request('passport', PASSPORT + path, payload, {'platform':'APP','appversion':'3.1.0'},
+                                  attempts=1, decode=decode)
 
 
 def field(data, key, limit=200):
@@ -60,225 +59,50 @@ def status():
                 'matchesVerified': AUTH.get('matchesVerified', False)}
 
 
-def score_value(value):
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
-        return value
-    return None
-
-
-def history_peak(scores):
-    if not isinstance(scores, list):
-        return None
-    valid = [score for value in scores if (score := score_value(value)) is not None]
-    return max(valid) if valid else None
-
-
-def season_history_peak(sid, season):
-    # historyScores belongs to the requested season, not the player's whole career.
-    response = remote('https://api.wmpvp.com/api/v2/csgo/pvpDetailStats',
-                      {'steamId64': sid, 'csgoSeasonId': season},
-                      {'appversion': lookup.APPVERSION})
-    if response.get('statusCode') != 0 or not isinstance(response.get('data'), dict):
-        raise ValueError('历史分数查询失败')
-    if response['data'].get('seasonId') != season:
-        raise ValueError('历史赛季返回不匹配')
-    return history_peak(response['data'].get('historyScores'))
-
-
-def history_seasons():
+def mark_verified(auth, value):
     with LOCK:
-        if SEASONS_CACHE['expires'] > time.monotonic():
-            return list(SEASONS_CACHE['seasons'])
-    response = remote('https://api.wmpvp.com/api/v2/common/matchdata/csgoSeasons',
-                      headers={'appversion': lookup.APPVERSION})
-    if response.get('statusCode') != 0 or not isinstance(response.get('data'), list):
-        raise ValueError('赛季列表查询失败')
-    seasons = list(dict.fromkeys(s.get('season') for s in response['data']
-                               if isinstance(s, dict) and isinstance(s.get('season'), str)
-                               and re.fullmatch(r'[A-Za-z0-9_-]{1,24}', s['season'])))
-    if not seasons:
-        raise ValueError('未取得赛季列表')
-    with LOCK:
-        SEASONS_CACHE.update(expires=time.monotonic() + 3600, seasons=seasons)
-    return seasons
+        if AUTH.get('token') == auth.get('token') and AUTH.get('steamId') == auth.get('steamId'):
+            AUTH['matchesVerified'] = value
 
 
-def query_history(sid):
-    with LOCK:
-        cached = HISTORY_CACHE.get(sid)
-        if cached and cached[0] > time.monotonic():
-            return dict(cached[1])
-    list_available = True
-    try:
-        seasons = history_seasons()
-    except Exception:
-        seasons, list_available = ['recent'], False
-    def fetch(season):
-        try:
-            return True, season_history_peak(sid, season)
-        except Exception:
-            return False, None
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        records = list(pool.map(fetch, seasons))
-    completed = sum(ok for ok, _ in records)
-    peak = history_peak([score for _, score in records])
-    complete = list_available and completed == len(seasons)
-    state = ('available' if peak is not None else 'empty') if complete else ('partial' if completed else 'unavailable')
-    result = {'historyPeakScore': peak, 'historyRankState': state,
-              'historySeasonsChecked': completed, 'historySeasonsTotal': len(seasons) if list_available else None}
-    # Only complete results are cached; transient failures must be retried.
-    if complete:
-        with LOCK:
-            if len(HISTORY_CACHE) >= 128:
-                HISTORY_CACHE.pop(next(iter(HISTORY_CACHE)))
-            HISTORY_CACHE[sid] = (time.monotonic() + 600, dict(result))
-    return result
-
-
-def honor_ids(value):
-    """Normalize the official honor IDs; empty or unknown codes add no badge."""
-    if isinstance(value, str):
-        values = value.split(',')
-    elif isinstance(value, list):
-        values = value
-    else:
-        values = [value]
-    return [code for item in values if (code := str(item).strip()) in ('1', '2', '3', '4', '5', '6', '7')]
-
-
-def missing_pro_honors(players, sid):
-    """Fallback matched against eight client rows when all Pro honors are null.
-
-    Select the first maximum in API player order, not every tied player. Only
-    complete ten-player numeric data can establish an award; zero earns none.
-    """
-    if len(players) != 10 or len({str(p.get('playerId')) for p in players}) != 10:
-        return []
-    if any(honor_ids(p.get('honor')) for p in players):
-        return []
-    awards = []
-    for code, key in [('2', 'headShot'), ('3', 'snipeNum'), ('4', 'entryKill'),
-                      ('5', 'endGame'), ('6', 'flashSuccess'), ('7', 'assist')]:
-        values = [score_value(p.get(key)) for p in players]
-        if any(v is None for v in values) or max(values) <= 0:
-            continue
-        winner = players[values.index(max(values))]
-        if str(winner.get('playerId')) == sid:
-            awards.append(code)
-    return awards
-
-
-def match_player(match, sid):
-    """Enrich one listed match, always selecting the player by ID, never nickname."""
-    result = dict(match)
-    result['honor'] = ','.join(dict.fromkeys(honor_ids(match.get('honor'))))
-    match_id = str(match.get('matchId') or '')
-    if not re.fullmatch(r'[A-Za-z0-9@_-]{1,80}', match_id):
-        return result
-    try:
-        response = remote('https://api.wmpvp.com/api/v1/csgo/match',
-                          {'matchId': match_id, 'platform': 'admin', 'dataSource': '3'},
-                          {'appversion': lookup.APPVERSION})
-        detail = response.get('data')
-        if response.get('statusCode') != 0 or not isinstance(detail, dict):
-            return result
-        players = detail.get('players') or []
-        player = next((p for p in players
-                       if str(p.get('playerId')) == sid), None)
-        if player:
-            # Prefer the match-list WE precision; fill only the known detail fields.
-            for key in ('we', 'pwRating', 'adpr', 'rws', 'kill', 'death', 'assist'):
-                if score_value(result.get(key)) is None:
-                    result[key] = player.get(key)
-            # The list may contain only a subset (e.g. "1"); detail contains
-            # the remaining awards. A nonempty list value must not hide them.
-            result['honor'] = ','.join(dict.fromkeys(
-                honor_ids(result.get('honor')) + honor_ids(player.get('honor'))))
-            if match.get('mode') == '完美官匹Pro':
-                derived = missing_pro_honors(players, sid)
-                if derived:
-                    result['honor'] = ','.join(dict.fromkeys(honor_ids(result['honor']) + derived))
-                    result['derivedHonors'] = derived
-            for key in ('mvp', 'pvpMvp'):
-                result[key] = result.get(key) is True or player.get(key) is True
-    except Exception:
-        pass  # Missing detail must never erase the confirmed match or become zero.
-    return result
-
-
-def recent_matches(sid, auth):
-    """Fetch ten individual games once; details supply ADR, RWS and honors."""
-    matches = lookup.match_list(sid, auth['steamId'], auth['token'], page_size=10)[:10]
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        enriched = list(pool.map(lambda match: match_player(match, sid), matches))
-    keys = ('startTime', 'endTime', 'mode', 'mapName', 'mapLogo', 'team', 'winTeam', 'score1', 'score2',
-            'kill', 'death', 'assist', 'adpr', 'rws', 'pwRating', 'we', 'pvpScore',
-            'pvpNormalRank', 'honor', 'derivedHonors', 'mvp', 'pvpMvp')
-    return [{key: match.get(key) for key in keys} for match in enriched]
-
-
-def query(data):
-    name = field(data, 'name', 100)
-    sid = field(data, 'steamId', 17)
-    if not sid:
-        if not name:
-            raise ValueError('请输入昵称')
-        response = remote(lookup.SEARCH_URL, {'keyword': name, 'page': 1},
-                          {'appversion': lookup.APPVERSION, 'Referer': 'https://client.wmpvp.com'})
-        if response.get('code') != 1 or not isinstance(response.get('result'), (list, type(None))):
-            raise ValueError('昵称搜索接口返回异常，请稍后重试')
-        candidates = [{**{k: str(r.get(k) or '') for k in ('steamId', 'pvpNickName', 'appNickName')},
-                       'pvpScore': score_value(r.get('pvpScore')), 'avatar': str(r.get('pvpAvatar') or '')}
-                      for r in response.get('result') or [] if re.fullmatch(r'\d{17}', str(r.get('steamId', '')))]
-        exact = [r for r in candidates if r['pvpNickName'] == name]
-        if len(exact) != 1:
-            return {'name': name, 'candidates': exact or candidates[:20],
-                    'needsChoice': True, 'message': '请核对并选择玩家' if candidates else '未搜索到玩家'}
-        picked = exact[0]
-        sid = picked['steamId']
-    else:
-        picked = {'steamId': sid, 'pvpNickName': name, 'appNickName': '', 'pvpScore': None}
-        if not re.fullmatch(r'\d{17}', sid):
-            raise ValueError('SteamID64 应为 17 位数字')
-        try:
-            response = remote(lookup.SEARCH_URL, {'keyword': name, 'page': 1},
-                              {'appversion': lookup.APPVERSION, 'Referer': 'https://client.wmpvp.com'})
-            if response.get('code') == 1:
-                matched = next((r for r in response.get('result') or [] if str(r.get('steamId')) == sid), {})
-                picked['pvpScore'] = score_value(matched.get('pvpScore'))
-                picked['avatar'] = str(matched.get('pvpAvatar') or '')
-        except Exception:
-            pass
+def validate_sid(sid):
     if not re.fullmatch(r'\d{17}', sid):
-        raise ValueError('SteamID64 应为 17 位数字')
-    row = {'name': name, **picked, 'recentMatches': None, 'matchMessage': ''}
-    row['historyPeakScore'] = None
-    row['historyRankState'] = 'unavailable'
-    try:
-        row.update(query_history(sid))
-    except Exception:
-        pass
-    if data.get('matches') is True:
-        with LOCK:
-            auth = dict(AUTH)
-        if not auth.get('token') or not auth.get('steamId'):
-            row['matchMessage'] = '请先登录并确认自己的 SteamID'
-        else:
-            try:
-                row['recentMatches'] = recent_matches(sid, auth)
-                row['matchMessage'] = '' if row['recentMatches'] else '近期无对局记录'
-                with LOCK:
-                    if AUTH.get('token') == auth['token']:
-                        AUTH['matchesVerified'] = True
-            except Exception:
-                row['matchMessage'] = '战绩查询失败：登录可能过期、SteamID 不匹配或接口不可用'
-                with LOCK:
-                    AUTH['matchesVerified'] = False
-    return row
+        raise ValueError('玩家标识格式不正确')
 
 
-def dispatch(path, data):
+async def dispatch(platform, path, data):
     global LAST_SMS
+    with LOCK:
+        auth = dict(AUTH)
+    if path == '/api/batch/start':
+        names = data.get('names')
+        if not isinstance(names, list) or not 1 <= len(names) <= 20 or any(
+                not isinstance(n, str) or not n.strip() or len(n) > 100 for n in names):
+            raise ValueError('请输入 1–20 个昵称')
+        sid = field(data, 'steamId', 17)
+        if sid:
+            validate_sid(sid)
+            if len(names) != 1:
+                raise ValueError('请只选择一个玩家')
+        return query_batch.start(platform, names, auth, sid, mark_verified)
+    if path in ('/api/batch/poll', '/api/batch/cancel'):
+        batch = query_batch.batches.get(field(data, 'batch', 64))
+        if path.endswith('/cancel'):
+            if batch:
+                batch.cancel()
+                await asyncio.gather(batch.task, return_exceptions=True)
+            return {}
+        if not batch:
+            raise ValueError('查询已结束或过期，请重新查询')
+        return await batch.poll(data.get('cursor', 0))
+    if path == '/api/batch/timing':
+        event = data.get('event')
+        ms, count = data.get('ms'), data.get('players')
+        if (event not in ('first_player', 'all_basic', 'complete') or not isinstance(ms, int)
+                or not 0 <= ms <= 86400000 or not isinstance(count, int) or not 1 <= count <= 20):
+            raise ValueError('无效的耗时记录')
+        LOG.info('display event=%s ms=%d players=%d', event, ms, count)
+        return {}
     if path == '/api/match-ranks':
         sid = field(data, 'steamId', 17)
         if not re.fullmatch(r'\d{17}', sid):
@@ -287,7 +111,7 @@ def dispatch(path, data):
             auth = dict(AUTH)
         if not auth.get('token') or not auth.get('steamId'):
             raise ValueError('请先在网页登录，再检查比赛字段')
-        matches = lookup.match_list(sid, auth['steamId'], auth['token'], page_size=10)[:10]
+        matches = await platform.matches(lookup.MATCH_URL, lookup.APPVERSION, sid, auth['steamId'], auth['token'])
         keys = ('matchId', 'startTime', 'endTime', 'mapName', 'mode', 'rank', 'oldrank', 'deltaRank',
                 'pvpScore', 'pvpScoreChange', 'pvpScoreChangeType', 'pvpStars', 'pvpNormalRank',
                 'pvpGrading', 'matchType', 'gameMode', 'dataSource', 'team', 'winTeam',
@@ -304,11 +128,25 @@ def dispatch(path, data):
             raise ValueError('请输入 1–20 个昵称，每行一个；status 模式请粘贴完整玩家行')
         return {'names': names}
     if path == '/api/query':
-        return query(data)
+        name, sid = field(data, 'name', 100), field(data, 'steamId', 17)
+        if sid:
+            validate_sid(sid)
+        elif not name:
+            raise ValueError('请输入昵称')
+        row = await basic(platform, name, auth, sid=sid, matches=data.get('matches') is True,
+                          auto_select=False, verified=mark_verified)
+        if not row.get('needsChoice'):
+            records = row.get('recentMatches') or []
+            history, details = await asyncio.gather(query_history(platform, row['steamId']),
+                asyncio.gather(*(match_player(platform, m, row['steamId']) for m in records)))
+            row.update(history)
+            if records:
+                row['recentMatches'] = details
+        return row
     if path == '/api/auth/status':
         return status()
     if path == '/api/auth/captcha':
-        result = passport('/initcaptcha')
+        result = await passport(platform, '/initcaptcha')
         if not result.get('capTicket'):
             raise ValueError('官方验证码未返回验证票据')
         return {'capTicket': result['capTicket']}
@@ -323,20 +161,20 @@ def dispatch(path, data):
             if time.monotonic() - LAST_SMS < 60:
                 raise ValueError('请等待 60 秒后再发送短信')
             LAST_SMS = time.monotonic()
-        passport('/securitycode?' + urllib.parse.urlencode({'mobilePhone': mobile, 'secCode': code, 'capTicket': ticket, 'reason': 1}))
+        await passport(platform, '/securitycode?' + urllib.parse.urlencode({'mobilePhone': mobile, 'secCode': code, 'capTicket': ticket, 'reason': 1}))
         return {'message': '验证码已发送，请查看手机短信'}
     if path == '/api/auth/login':
         mobile, code = field(data, 'mobile', 11), field(data, 'code', 6)
         if not re.fullmatch(r'\d{11}', mobile) or not re.fullmatch(r'\d{6}', code):
             raise ValueError('请输入手机号和 6 位短信验证码')
-        result = passport('/account/login', {'appId': 10, 'mobilePhone': mobile, 'securityCode': code})
+        result = await passport(platform, '/account/login', {'appId': 10, 'mobilePhone': mobile, 'securityCode': code})
         info = (result.get('result') or {}).get('loginResult', {}).get('accountInfo', {})
         token = info.get('token')
         if not isinstance(token, str) or not token:
             raise ValueError('官方登录响应未包含可用凭据')
         sid = str(info.get('steamId') or '')
         try:
-            profile = remote('https://partner.wmpvp.com/thirdparty/steamcn/user/login', {}, {'Authorization': token})
+            profile = await platform.request('profile', 'https://partner.wmpvp.com/thirdparty/steamcn/user/login', {}, {'Authorization': token}, attempts=1)
             user = (profile.get('result') or {}).get('user') or {}
             sid = str(user.get('steamId') or sid)
         except Exception:
@@ -356,7 +194,7 @@ def dispatch(path, data):
         if not re.fullmatch(r'\d{17}', sid):
             raise ValueError('请输入自己的 17 位 SteamID64')
         try:
-            lookup.match_list(sid, sid, auth['token'], page_size=1)
+            await platform.matches(lookup.MATCH_URL, lookup.APPVERSION, sid, sid, auth['token'], size=1, cache=False)
         except Exception:
             raise ValueError('战绩接口验证失败，请核对 SteamID；也可能是此登录凭据不适用于战绩接口')
         with LOCK:
@@ -416,7 +254,9 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict):
                 raise ValueError('输入格式不正确')
-            self.send(200, dispatch(self.path, data))
+            self.send(200, runtime.run(dispatch, self.path, data))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
         except ValueError as exc:
             self.send(400, {'error': str(exc)})
         except Exception:
@@ -439,4 +279,16 @@ if __name__ == '__main__':
         sys.exit()
     if '--open' in sys.argv:
         threading.Timer(0.5, lambda: webbrowser.open(ORIGIN)).start()
-    server.serve_forever()
+    cache_path = Path(os.environ.get('WMPVP_CACHE_PATH', ROOT / '.lookup-cache' / 'stats.sqlite3'))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = RotatingFileHandler(cache_path.parent / 'performance.log', maxBytes=1024*1024,
+                                   backupCount=2, encoding='utf-8')
+    log_file.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+    LOG.addHandler(log_file)
+    LOG.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(message)s')
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        runtime.close()
