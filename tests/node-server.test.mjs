@@ -16,6 +16,17 @@ function engine(t,fetcher,extra={}) {
   t.after(()=>e.db.close());return e;
 }
 const ok=data=>Response.json({statusCode:0,data});
+test('API-only deployment probes the initialized handler without login or upstream calls',async t=>{
+  const e=engine(t,()=>{throw Error('unexpected upstream call');});
+  const request=(path,method,config=env)=>handleRequest(new Request('http://127.0.0.1:18766'+path,{method}),config,{engine:e});
+  assert.equal((await request('/app.js','GET')).status,405);
+  const ready=await request('/api/health','POST');
+  assert.equal(ready.status,200);
+  assert.deepEqual(await ready.json(),{service:'wmpvp-node',batchApi:1});
+  assert.equal(ready.headers.get('set-cookie'),null);
+  assert.equal((await request('/api/health','POST',{})).status,503);
+  assert.equal((await request('/api/batch/start','POST')).status,403);
+});
 function candidate(id,name) {return {steamId:id,pvpNickName:name,pvpScore:2001};}
 
 test('encrypted browser sessions isolate batches and ignore spoofed body auth and owner',async t=>{

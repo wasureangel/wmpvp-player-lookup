@@ -23,13 +23,21 @@ fi
 [[ "$action" == install ]] || { echo '用法: update.sh install|rollback'; exit 1; }
 systemctl is-active --quiet "$unit"
 "$nodebin" -e "const [a,b]=process.versions.node.split('.').map(Number);if(a<22||(a===22&&b<13))process.exit(1);require('node:sqlite')" || { echo '此服务需要 Node.js 22.13 或以上版本'; exit 1; }
-id=$("$nodebin" "$script" prepare "$site")
+api_port=18766
+listeners=$(ss -H -ltnp "sport = :$api_port")
+[[ "$listeners" == *"pid=$pid,"* ]] || { echo "$unit 的主进程未监听 $api_port，原服务继续运行"; exit 1; }
 user=$(systemctl show -p User --value "$unit")
 if [[ ! -d .lookup-cache ]]; then install -d -m 700 -o "${user:-root}" .lookup-cache; fi
 runuser -u "${user:-root}" -- test -w "$site/.lookup-cache"
-# Compare the actual served JS to the on-disk bundle, both before and after switching.
-probe() { curl --noproxy '*' -fsS --max-time 3 http://127.0.0.1:18766/app.js | cmp -s - dist/app.js; }
-probe || { echo '18766 返回的 app.js 与部署目录不同，原服务继续运行'; exit 1; }
+id=$("$nodebin" "$script" prepare "$site")
+# Record the staged frontend before activation moves it into place.
+assets=$(cd ".query-releases/$id/new-dist" && sha256sum app.js app.css index.html)
+probe() {
+  local result
+  result=$(curl --noproxy '*' -fsS --max-time 3 -H 'Content-Type: application/json' \
+    --data '{}' "http://127.0.0.1:$api_port/api/health") || return 1
+  "$nodebin" -e 'try { const r=JSON.parse(process.argv[1]); process.exitCode=Number(r?.service!=="wmpvp-node" || r?.batchApi!==1); } catch { process.exitCode=1; }' "$result"
+}
 recover() {
   trap - ERR HUP INT TERM
   set +e
@@ -44,6 +52,7 @@ recover() {
 trap recover ERR HUP INT TERM
 systemctl stop "$unit"
 "$nodebin" "$script" activate "$site" "$id"
+(cd dist && sha256sum --check --status <<<"$assets")
 systemctl start "$unit"
 for _ in {1..12}; do
   if systemctl is-active --quiet "$unit" && probe; then
@@ -53,4 +62,5 @@ for _ in {1..12}; do
   fi
   sleep 1
 done
+echo "新版 API 未在 $api_port 返回预期的健康状态，正在回滚" >&2
 recover

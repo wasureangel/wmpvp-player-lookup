@@ -17,7 +17,7 @@ cd ~/wmpvp-player-lookup
 git switch main && git pull --ff-only origin main && sudo bash deploy/ubuntu/update.sh install
 ```
 
-脚本先核对线上服务和已知模块指纹，并用实际服务的 Node 可执行文件检查版本，构建好静态页面后才短暂停止服务。它会保留原来的 server、dist 和自定义静态文件，在本机 18766 核对返回的新版 app.js。切换失败会尝试恢复原版本。升级后刷新原来的网页，仍可使用原站点口令和有效登录会话。可在系统日志查看查询耗时：
+脚本先确认 18766 属于目标服务并核对已知模块指纹。构建完成后才短暂停服，备份原来的 server、dist 和自定义静态文件。切换时比对部署目录里的 HTML、JS、CSS 与本次构建的 SHA-256，再向 18766 发送 `POST /api/health` 检查新版查询接口。Nginx 可以独立提供静态文件。任一步切换检查失败都会尝试恢复原版本。升级后刷新原来的网页，仍可使用原站点口令和有效登录会话。可在系统日志查看查询耗时：
 
 ```bash
 journalctl -u wmpvp-multi-eaed139.service -n 50 --no-pager
