@@ -7,7 +7,10 @@ let captcha = null, captchaTicket = '', smsUntil = 0;
 async function api(path, data = {}, signal) {
   const response = await fetch('/api/' + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-App-Token': document.querySelector('meta[name="app-token"]').content}, signal, body: JSON.stringify(data)});
   const value = await response.json();
-  if (!response.ok) throw new Error(value.error || '请求失败');
+  if (!response.ok) {
+    if (value.accessRequired) authView(value);
+    throw new Error(value.error || '请求失败');
+  }
   return value;
 }
 function latestOfficialRank(records) {
@@ -36,12 +39,23 @@ function updateFilterStatus() {
 }
 $('exclude-players').addEventListener('input', updateFilterStatus);
 function authView(data) {
-  $('auth-badge').textContent = data.loggedIn ? '已登录' : '未登录';
-  $('login-form').hidden = data.loggedIn; $('logged-in').hidden = !data.loggedIn;
+  const locked = Boolean(data.accessRequired);
+  $('site-access').hidden = !locked;
+  $('query').disabled = locked;
+  $('auth-badge').textContent = locked ? '站点未解锁' : data.loggedIn ? '已登录' : '未登录';
+  $('login-form').hidden = locked || data.loggedIn; $('logged-in').hidden = !data.loggedIn;
   $('my-steamid').value = data.steamId || '';
   $('manual-account').hidden = Boolean(data.steamId);
   $('account').textContent = data.matchesVerified ? '战绩接口已验证，可查询近期表现。' : '官方登录已完成，战绩权限尚未验证。';
 }
+$('unlock').addEventListener('click', async () => {
+  $('unlock').disabled = true;
+  try {
+    authView(await api('access/unlock', {password:$('site-password').value}));
+    $('site-password').value = ''; message('access-message','');
+  } catch (e) { message('access-message', e.message, true); }
+  finally { $('unlock').disabled = false; }
+});
 function rankBadge(rank) {
     const badge = node('span', '', 'rank-icon');
     const letter = node('img', '', rank.icon === 'S' ? 'rank-s' : 'rank-letter');
@@ -377,6 +391,6 @@ $('login').addEventListener('click', async () => {
   finally { $('login').disabled = false; }
 });
 $('verify').addEventListener('click', async () => { $('verify').disabled = true; try { authView(await api('auth/steamid', {steamId: $('my-steamid').value.trim()})); message('auth-message', '战绩权限验证成功。'); } catch (e) { message('auth-message', e.message, true); } finally { $('verify').disabled = false; } });
-$('logout').addEventListener('click', async () => { try { authView(await api('auth/logout')); message('auth-message', '已清除本机内存中的登录凭据。'); } catch (e) { message('auth-message', e.message, true); } });
+$('logout').addEventListener('click', async () => { try { cancel(); authView(await api('auth/logout')); rows.clear(); $('results').replaceChildren(); message('auth-message', '已退出登录。'); } catch (e) { message('auth-message', e.message, true); } });
 api('auth/status').then(authView).catch(e => message('auth-message', e.message, true));
 })();

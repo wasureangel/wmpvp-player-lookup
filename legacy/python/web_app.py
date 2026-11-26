@@ -17,6 +17,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parent
+ASSETS = ROOT.parents[1]
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w', encoding='utf-8')
 if sys.stderr is None:
@@ -234,14 +235,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/health':
             return self.send(200, {'app': 'wmpvp-local-web-v1'})
         if re.fullmatch(r'/rank-assets/(?:D|C|C1|C11|B|B1|B11|A|A1|A11|none|ABC_bg|C11_bg|B11_bg|A11_bg)\.svg', self.path) or self.path == '/rank-assets/s-brass.png':
-            image_path = ROOT / self.path.lstrip('/')
+            image_path = ASSETS / self.path.lstrip('/')
             return self.send(200, image_path.read_bytes(), 'image/svg+xml' if self.path.endswith('.svg') else 'image/png')
         files = {'/': ('web.html', 'text/html; charset=utf-8'), '/app.js': ('web.js', 'text/javascript; charset=utf-8'),
                  '/app.css': ('web.css', 'text/css; charset=utf-8')}
         if self.path not in files:
             return self.send(404, {'error': '页面不存在'})
         name, kind = files[self.path]
-        body = (ROOT / name).read_text(encoding='utf-8').replace('__CSRF__', CSRF).encode()
+        body = (ASSETS / name).read_text(encoding='utf-8').replace('__CSRF__', CSRF).encode()
         self.send(200, body, kind)
 
     def do_POST(self):

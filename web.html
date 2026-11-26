@@ -10,6 +10,11 @@
   <div class="page-heading"><h1>玩家表现</h1><p>批量查询玩家，查看最近 10 场逐场战绩。</p></div>
   <div class="workspace">
     <aside class="sidebar">
+      <section id="site-access" class="control-section" hidden>
+        <h2>访问此站点</h2><label for="site-password">站点访问口令</label>
+        <input id="site-password" class="full" type="password" autocomplete="current-password" maxlength="200">
+        <button id="unlock" class="primary full spaced">解锁</button><div id="access-message" class="notice" role="status"></div>
+      </section>
       <section class="control-section">
         <h2>开始查询</h2><label for="mode">输入方式</label>
         <select id="mode" class="full"><option value="names">玩家昵称 · 每行一个</option><option value="status">游戏控制台 status 文本</option></select>
