@@ -1,24 +1,39 @@
-# CS2 玩家查询 · 本机网页版
+# CS2 玩家查询 · Node.js 网页版
 
-在自己电脑上运行的完美平台玩家查询工具。浏览器访问 `http://127.0.0.1:8765/`，由本机 Python 服务处理登录和查询。项目已恢复为本地运行，不再使用 Cloudflare Pages / Functions。
+桌面和 Ubuntu 服务器共用 Node.js 查询引擎。运行需要 **Node.js 22.13 或更新版本**。HTTP 连接、SQLite、加密 Cookie 和静态文件服务均使用 Node.js 内置模块。网页服务没有第三方运行时依赖。
 
-## 启动
+## 本机启动
 
-需要 Python 3.10 或更新版本。Windows 双击 `启动网页版.cmd`，首次启动会创建项目虚拟环境并安装 HTTP 客户端 httpx。已有内置运行时且已装好 httpx 时也能直接启动。
+在项目目录执行 `npm start`，浏览器访问 `http://127.0.0.1:8765/`。Windows 也可以双击 `启动网页版.cmd`。桌面模式只监听回环地址，每个浏览器独立登录，重启时会重新生成会话密钥。
 
-在 Linux 服务器上更新已有 Git 安装，先进入项目目录，确认当前分支和本机改动，再运行以下命令。PR 合并前可用它的分支进行试用，合并后使用 `main`。
+## 更新现有 Ubuntu 多用户部署
 
-```sh
-git status --short --branch
-git switch main
-git pull --ff-only origin main
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+此流程适用于已运行的 `wmpvp-multi-eaed139.service`，工作目录为 `/opt/wmpvp-multi-eaed139`，Nginx 转发到本机 18766。升级沿用服务器现有的 `listen.mjs`、systemd 环境、站点口令、会话密钥和 IP 入口。无需安装 Python 或执行 npm install。
+
+在保存源码的 Git 仓库中运行。以下命令使用已合并的 main：
+
+```bash
+cd ~/wmpvp-player-lookup
+git switch main && git pull --ff-only origin main && sudo bash deploy/ubuntu/update.sh install
 ```
 
-将现有服务的 Python 启动路径指向项目的 `.venv/bin/python`，入口仍是 `web_app.py`，然后用原来的服务管理器重启并重新登录。手动运行可用 `.venv/bin/python web_app.py`。在桌面环境可增加 `--open` 自动打开浏览器。已有虚拟环境的安装可以继续使用原环境。
+脚本先核对线上服务和已知模块指纹，并用实际服务的 Node 可执行文件检查版本，构建好静态页面后才短暂停止服务。它会保留原来的 server、dist 和自定义静态文件，在本机 18766 核对返回的新版 app.js。切换失败会尝试恢复原版本。升级后刷新原来的网页，仍可使用原站点口令和有效登录会话。可在系统日志查看查询耗时：
 
-默认访问 `http://127.0.0.1:8765/`。关闭浏览器不会停止后台服务；电脑或服务重启后，需要重新启动、重新登录。GitHub 源码不包含内置 Python 运行时，首次下载请先安装 Python。
+```bash
+journalctl -u wmpvp-multi-eaed139.service -n 50 --no-pager
+```
+
+需要回到上一次部署时，在同一源码目录执行：
+
+```bash
+sudo bash deploy/ubuntu/update.sh rollback
+```
+
+每次切换的备份在部署目录的 `.query-releases/`。自动检查仅覆盖服务运行和静态文件，实际登录、短信、反向代理和平台限流以服务器上的结果为准。
+
+## 新建服务器实例
+
+设置 `WMPVP_PUBLIC_ORIGIN` 为浏览器使用的完整 HTTPS 来源，`WMPVP_PORT` 为监听端口，`SITE_PASSWORD` 为至少 16 字符的访问口令，`SESSION_SECRET` 为随机生成的 64 位十六进制密钥。用服务管理器保管这些设置并运行 `node listen.mjs`。Node 只监听 127.0.0.1，由 HTTPS 反向代理转发到该端口。已有的 Ubuntu 实例按上方升级流程继续使用原入口。
 
 ## 查询功能
 
@@ -35,28 +50,20 @@ python3 -m venv .venv
 
 ## 查询过程与性能
 
-页面先按输入顺序留出卡片位置。后台并发搜索昵称、取近期列表，哪个玩家先返回就先填哪张卡。同名账号只先查列表，筛选完成后才为保留的账号补详情和历史分。每场比赛的数值和高光独立更新。取消或开始新查询会取消旧批次，已完成的列表仍可阅读。
+所有玩家共用 Node 原生 fetch 的连接池和同一个优先队列，并发上限由 `WMPVP_CONCURRENCY` 设置，默认 6。查询先取昵称和近期列表，确认同名账号后再补各场高光和历史分。卡片按输入顺序保留位置，各字段独立更新。取消批次会中止无人等待的上游请求，旧响应不能覆盖新卡片。
 
-一个进程共用一个 `httpx.AsyncClient`。环境变量 `WMPVP_CONCURRENCY` 控制所有上游请求合计的并发上限，默认 6，支持 1–64。排队时基础查询优先于详情，详情优先于历史。遇到 429 会按主机共享等待时间，遵守秒数或 HTTP 日期格式的 `Retry-After`。长时间限流直接提示稍后重试。短信和登录请求只发送一次。
+SQLite 默认写入 `.lookup-cache/node.sqlite3`，可用 `WMPVP_CACHE_PATH` 指定文件。比赛按 matchId 缓存，赛季按 SteamID 与赛季编号缓存。已结束比赛和赛季保存 180 天，当前赛季 5 分钟，近期列表 60 秒。近期列表按登录凭据和查看者隔离。同一数据有多个等待者时共用一次请求。日志记录接口类别、耗时、次数、命中率、重试、失败类别及浏览器显示时间。遇到限流时同主机的请求共同遵守 Retry-After。登录和短信只发送一次。
 
-SQLite 默认位于 `.lookup-cache/stats.sqlite3`，可通过 `WMPVP_CACHE_PATH` 指定位置。已结束比赛按 matchId、已结束赛季按 SteamID 和赛季编号缓存 180 天。当前赛季缓存 5 分钟，近期列表按登录会话隔离缓存 60 秒。并发读取同一缓存键时共享上游请求。失败不会写入缓存。
+### 浏览器实测
 
-同目录的 `performance.log` 记录接口类型、请求次数、耗时、缓存命中率、重试和失败类别，以及浏览器首张卡片、所有基础结果和完整查询的显示耗时。文件达到 1 MiB 后轮换，保留两份旧文件。日志不包含请求地址、昵称、手机号、请求体或 token。
+桌面 Chrome、10 名玩家、100 条战绩，每次模拟接口响应延迟 120 ms，每人 25 个赛季，有一场比赛为十人共享。下表为点击查询到画面首次显示、十人基础表齐全、全部补完的实测秒数。
 
-### 十人浏览器测速
-
-在已登录的本机服务使用桌面 Chrome，从点击查询算起，按动画帧观察实际战绩表。每组均显示了 10 名玩家、100 条记录。单位为秒。
-
-| 场景 | 首张战绩表 | 全部基础战绩 | 完整查询 |
+| Node.js 场景 | 首张战绩表 | 十人基础战绩 | 全部补完 |
 |---|---:|---:|---:|
-| 完美平台，登录后使用现有十人样本 | 0.296 | 0.677 | 12.147 |
-| 本地固定上游，旧版冷缓存 | 2.042 | 24.544 | 24.544 |
-| 本地固定上游，新版冷缓存 | 0.353 | 0.708 | 7.731 |
-| 本地固定上游，新版热缓存 | 0.170 | 0.301 | 0.301 |
+| 冷缓存 | 0.303 | 0.541 | 7.613 |
+| 热缓存 | 0.179 | 0.286 | 0.286 |
 
-真实样本使用当时的本机缓存。十个昵称触发 10 次搜索、11 次近期列表请求（含同名筛选）、89 次详情请求和 225 次赛季请求，均成功返回。固定上游每次响应延迟 120 ms，每人有 10 场比赛及 25 个赛季，每组有一场十人共享比赛。冷缓存采用新服务和新数据库，热缓存重复同一批玩家。真实平台数据为单次测量，网络和限流会影响下一批耗时。
-
-复测时安装桌面 Chrome 及开发工具 `npm install --no-save --package-lock=false playwright-core`。运行 `python tests/benchmark_server.py` 后，在另一终端执行 `node scripts/benchmark.cjs http://127.0.0.1:8870`。重复执行可测热缓存。使用已登录服务和每行一个昵称的 UTF-8 文本可测真实接口，例如 `node scripts/benchmark.cjs http://127.0.0.1:8765 names.txt`。旧版对照可用 `--root 旧版源码目录` 启动同一组固定上游。
+该组使用模拟上游。真实完美平台响应取决于服务器出口、登录状态和限流。维护者可在装有 Chrome 的机器安装开发工具 `npm install --no-save --package-lock=false playwright-core`，运行 `node scripts/benchmark.cjs --fixture` 复测。要测真实平台，运行 `node scripts/benchmark.cjs 访问地址 names.txt`，在弹出的浏览器内完成登录；文件每行一个昵称，共十名。
 
 ## 高光来源与限制
 
@@ -73,39 +80,18 @@ SQLite 默认位于 `.lookup-cache/stats.sqlite3`，可通过 `WMPVP_CACHE_PATH`
 
 各项取正数最高值，并列时取接口记录顺序的第一位。这个补全方式与用户提供的八场客户端截图相符，尚不能保证覆盖客户端所有特殊规则；缺失数据不会当成零推算。悬停补全图标可查看来源说明。MVP 使用平台已有标记，不通过以上规则生成。
 
-## 登录和隐私
+## 登录和会话
 
-在网页输入手机号，点击发送验证码，亲自完成完美官方人机验证，再输入短信验证码登录。登录后可验证战绩权限。
+站点解锁、官方人机验证、短信与 SteamID 验证沿用原多用户协议。每个浏览器的凭据由 AES-GCM 加密保存在 HttpOnly Cookie 中，有效期最长 8 小时。服务端从已验证的 Cookie 确定批次所属会话，检查每一次读取和取消请求。请求体中的账号凭据和会话标识不能更改批次归属。
 
-官方登录凭据只保存在本机服务内存中，不写入项目文件，不提交到 GitHub。退出本机登录或重启服务会清除它们。本机服务只监听 `127.0.0.1`，接口检查访问来源及页面令牌。平台接口和验证码的可用性仍取决于完美服务。
-
-## 开发与仓库检查
-
-应用运行不需要 Node.js。维护前端时可使用 Node.js 22 或更新版本：
+## 开发检查
 
 ```sh
 npm run check
 npm test
-python tests/local_web.py
-python tests/query_performance.py
+npm run build
 ```
 
-GitHub Actions 运行以上离线代码检查，不发送短信，不登录真实账号，也不自动部署。实际页面、登录及战绩效果由使用者验收。
-
-## 文件
-
-```text
-web.html / web.js / web.css  本机网页
-web_app.py                  只监听本机的网页服务
-wmpvp_lookup.py             命令行入口与输入解析
-upstream.py                 HTTP 连接池、全局调度、缓存、请求去重
-player_query.py / query_batch.py   战绩分阶段查询与取消
-rank-assets/                段位图标
-启动网页版.cmd              Windows 启动入口
-网页版说明.txt              详细使用说明
-tests/                      离线回归用例
-```
-
-旧 Cloudflare 实现可从 Git 历史恢复。移除仓库部署配置不会删除已经创建的 Cloudflare 项目。
+构建生成 dist/ 静态资源。部署回滚回归用例使用旧版本的 Git 对象，可在具有完整仓库历史的环境执行 `node --test tests/node-release.test.mjs`。原 Python 工具和原回归用例保留在 `legacy/python/`，作为旧版本兼容入口。当前网页版的启动、构建、查询和升级均由 Node.js 完成。
 
 接口参考：[PerfectWorld API Collection](https://github.com/Redamancy520/PerfectWorld-API-Collection)。段位图标来自完美官方资源，权利归原权利人所有。

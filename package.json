@@ -3,14 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local CS2 player lookup with ten-match history",
+  "description": "Node.js CS2 player lookup with isolated sessions and progressive match results",
   "scripts": {
-    "start": "python web_app.py --open",
+    "start": "node listen.mjs",
     "check": "node scripts/check.mjs",
-    "test": "node tests/frontend.cjs",
-    "test:ui": "node tests/frontend.cjs"
+    "test": "node tests/frontend.cjs && node --test tests/node-server.test.mjs",
+    "test:ui": "node tests/frontend.cjs",
+    "build": "node scripts/build.mjs"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   }
 }
