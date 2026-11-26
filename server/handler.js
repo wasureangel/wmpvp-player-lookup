@@ -52,6 +52,11 @@ export async function handleRequest(request,env,{engine,localDesktop=false}={}) 
   try {
     const url=new URL(request.url),path=url.pathname;
     if(request.method!=='POST')return response({error:'仅支持 POST 请求'},405);
+    // Used by the local deployment probe before a browser session exists.
+    if(path==='/api/health') {
+      configuration(env);
+      return response({service:'wmpvp-node',batchApi:1});
+    }
     if(url.protocol!=='https:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname))throw new AppError('请使用 HTTPS 访问',403);
     // The header is a public request marker. Origin + JSON + SameSite cookies
     // enforce the actual cross-site request boundary; no wildcard CORS is sent.
